@@ -103,7 +103,7 @@ The build context is an allowlist in `.dockerignore`, and the Dockerfile separat
 
 ## Verification and deployment status
 
-GitHub Actions runs the isolated Python suite on Python 3.9 and 3.11 and the browser JavaScript checks on Node 22. These tests use controlled fixtures, do not download official CSVs, do not require R and do not call a live model. A manually selected workflow option builds the Docker image and installs OS packages; it still downloads no survey data and consumes no API secrets.
+GitHub Actions pins the test runner to Ubuntu 22.04, which has `setup-python` builds for both Python 3.9 and 3.11. It also runs the browser JavaScript checks on Node 22. This avoids installing Python 3.9 on an unsupported newer `ubuntu-latest` image. These tests use controlled fixtures, do not download official CSVs, do not require R and do not call a live model. A manually selected workflow option builds the Docker image and installs OS packages; it still downloads no survey data and consumes no API secrets.
 
 Local checks:
 
