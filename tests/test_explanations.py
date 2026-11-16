@@ -95,7 +95,9 @@ class ExplanationTests(unittest.TestCase):
         for value in ['Female','30.00%','10.00%','20.00 percentage points','does not establish statistical significance']:
             self.assertIn(value,answer)
         self.assertNotIn('causes',answer)
-        self.assertGreaterEqual(answer.count('### '),3)
+        self.assertNotIn('### ',answer)
+        self.assertLess(len(answer.split()),220)
+        self.assertNotIn('How the calculation works',answer)
 
     def test_ci_example_and_joint_comparison_limits(self):
         answer,_=build_explanation('置信区间是什么意思',result())

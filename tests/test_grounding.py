@@ -40,6 +40,24 @@ class GroundingTests(unittest.TestCase):
         self.assertNotEqual(payload['instructions'], attack)
         self.assertIn('exactly once', grounding.SYSTEM_PROMPT)
 
+    def test_compact_research_draft_retains_every_numeric_fact_without_a_methods_lecture(self):
+        from nhis_agent.answers import build_analysis_answer
+        result={'status':'ok','survey':{'rows':[{'group_id':'overall','status':'ok','estimate':.123,
+                 'se':.01,'ci_low':.103,'ci_high':.143,'n':500}],
+                 'design':{'constructed_before_domain_subset':True}},
+                 'measurement':{'status':'not_requested'}}
+        draft=build_analysis_answer(result,{'year':2024,'age_min':25,'age_max':64,'group_by':'overall'})
+        payload=grounding.prepare('What is the proportion?',draft)
+        rendered=grounding.render(payload,document(payload))
+        self.assertIn('12.30%',rendered)
+        self.assertIn('| Overall | 500 |',rendered)
+        self.assertNotIn('### How the calculation works',rendered)
+        self.assertNotIn('Model measurement was not enabled',rendered)
+        self.assertLessEqual(len(payload['facts']),8)
+        self.assertIn('Be conversational and concise',grounding.SYSTEM_PROMPT)
+        missing=document(payload);missing['blocks'].pop()
+        with self.assertRaises(ValueError):grounding.render(payload,missing)
+
     def test_evidence_roundtrip_preserves_original_numbers_tables_and_limits(self):
         rendered = grounding.render(self.payload, document(self.payload))
         for fact in self.payload['facts']:

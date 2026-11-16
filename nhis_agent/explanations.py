@@ -359,21 +359,25 @@ def _summary(current):
     rows = _rows(current); contrasts = _contrasts(current)
     if _terms(current): return _regression(current)
     if not rows: return _sections([('There are not enough released estimates to interpret', 'No group proportion in this excerpt passes the status and value checks; a conclusion cannot be filled in from incomplete content.'), ('A useful next question', 'Run a specific registered grouping, or ask about variables, sample selection or calculation methods.')]), 'clarification'
-    parts = [('Whom the result describes', _scope(current) + ' The outcome is self-rated fair or poor health, not a clinical diagnosis.')]
-    if len(rows) == 1: parts.append(('The direct reading', _example(current) or 'The cell was released but its explanatory fields are incomplete.'))
+    parts = [_scope(current).strip()]
+    if len(rows) == 1: parts.append(_example(current) or 'The cell was released but its explanatory fields are incomplete.')
     else:
         low, high = min(rows, key=lambda row: row['estimate']), max(rows, key=lambda row: row['estimate'])
-        parts.append(('What the recorded estimates show', 'Among **released** groups, ' + _row_name(high) + ' has the highest point estimate (' + _pct(high['estimate']) + ') and ' + _row_name(low) + ' the lowest (' + _pct(low['estimate']) + '). Their point-estimate difference is **' + f'{(high["estimate"] - low["estimate"]) * 100:.2f}' + ' percentage points**. Suppressed cells do not enter this ranking.'))
+        parts.append('Among released groups, **' + _row_name(high) + '** reports fair or poor health most often (' + _pct(high['estimate']) + '), compared with ' + _pct(low['estimate']) + ' for **' + _row_name(low) + '**. The point-estimate gap is **' + f'{(high["estimate"] - low["estimate"]) * 100:.2f}' + ' percentage points**. Suppressed cells are excluded.')
     if contrasts:
         row = contrasts[0]
-        parts.append(('Uncertainty in the difference', 'The released registered contrast ' + _contrast_name(row) + ' is **' + _pp(row['estimate']) + ' percentage points**, with a 95% difference interval of **' + _pp(row['ci_low']) + ' to ' + _pp(row['ci_high']) + ' percentage points**. This interval uses the joint survey covariance.'))
-    else: parts.append(('What this does and does not establish', 'The proportions describe self-rated health in the defined population. The highest–lowest gap is only a point-estimate comparison here. Without its joint variance, it does not establish statistical significance or a social or medical explanation for the difference.'))
+        parts.append('For the registered ' + _contrast_name(row) + ' comparison, the difference is **' + _pp(row['estimate']) + ' percentage points** (95% difference interval **' + _pp(row['ci_low']) + ' to ' + _pp(row['ci_high']) + '**), using joint survey covariance. ' +
+                     ('Because that interval includes zero, the difference remains uncertain.' if row['ci_low'] <= 0 <= row['ci_high'] else
+                      'The interval excludes zero, supporting a difference in this comparison.'))
+    elif len(rows) > 1:
+        parts.append('That gap does not establish statistical significance without its joint variance. Separate group intervals are not a test of the difference.')
+    parts[-1] += ' This describes self-rated health, not a clinical diagnosis, and cannot establish causation.'
     measurement = current.get('measurement', {})
     if measurement.get('status') in ('partial', 'failed', 'blocked'):
         counts = ''
         if _finite(measurement.get('valid_calls')) and _finite(measurement.get('planned_calls')): counts = ' Valid calls: ' + _num(measurement['valid_calls']) + '/' + _num(measurement['planned_calls']) + '.'
-        parts.append(('Assess model measurement separately', 'Model measurement status: **' + _clean(measurement['status']) + '**.' + counts + ' Incomplete calls are not a complete repeated experiment; survey group differences are not model-error estimates.'))
-    return _sections(parts), 'explanation'
+        parts.append('Model measurement status: **' + _clean(measurement['status']) + '**.' + counts + ' Incomplete calls are not a complete repeated experiment; survey group differences are not model-error estimates.')
+    return '\n\n'.join(parts), 'explanation'
 
 
 def build_explanation(text, current, previous=None):

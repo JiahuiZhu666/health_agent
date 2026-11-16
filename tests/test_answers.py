@@ -63,7 +63,7 @@ class AnswerTests(unittest.TestCase):
         self.assertNotRegex(build_analysis_answer(value, SPEC), r'[\u3400-\u9fff]')
 
     def test_basic_answer_has_actual_table_and_explained_design(self):
-        answer = build_analysis_answer(fixture(), SPEC)
+        answer = build_analysis_answer(fixture(), SPEC, question='How did you calculate that?')
         self.assertTrue(answer.startswith('**Conclusion:**'))
         self.assertIn('32.10%', answer)
         self.assertIn('12.30%', answer)
@@ -83,6 +83,36 @@ class AnswerTests(unittest.TestCase):
         self.assertGreater(len(answer.split()), 300)
         self.assertNotRegex(answer, r'[\u3400-\u9fff]')
 
+    def test_default_answer_is_concise_without_losing_released_evidence(self):
+        answer = build_analysis_answer(fixture(), SPEC)
+        detailed = build_analysis_answer(fixture(), SPEC, question='Show the full calculation step by step.')
+        self.assertIn('32.10%',answer)
+        self.assertIn('12.30%',answer)
+        self.assertIn('+19.80 percentage points',answer)
+        self.assertEqual(sum(line.startswith('- ') for line in answer.splitlines()),2)
+        self.assertIn('Method in brief',answer)
+        self.assertIn('full adult survey design',answer)
+        self.assertIn('t critical values',answer)
+        self.assertIn('Outcome missing: 100',answer)
+        self.assertIn('do not establish causation',answer)
+        self.assertNotIn('### How the calculation works',answer)
+        self.assertNotIn('95% of repeated samples',answer)
+        self.assertNotIn('Model measurement was not enabled',answer)
+        self.assertNotIn('A useful next step',answer)
+        self.assertLess(len(answer.split()),350)
+        self.assertLess(len(answer),len(detailed)*.65)
+        for group in ('Less than high school','High school or GED','Some college or an associate degree','Bachelor’s degree or higher'):
+            self.assertIn('| '+group+' |',answer)
+
+    def test_bilingual_explicit_detail_requests_keep_complete_calculation_steps(self):
+        for question in ('详细解释计算过程','展开讲讲','How did you calculate that?',
+                         'Break it down','Walk me through the calculation','Show your work in detail'):
+            with self.subTest(question=question):
+                answer=build_analysis_answer(fixture(),SPEC,question=question)
+                self.assertIn('### How the calculation works',answer)
+                self.assertIn('Σ(w×y) / Σw',answer)
+                self.assertIn('Full adult sample 9,000',answer)
+
     def test_scope_filters_and_ids_are_translated(self):
         spec = dict(SPEC, filters={'sex': 'female', 'race': ['nh_black']})
         answer = build_analysis_answer(fixture(), spec)
@@ -94,7 +124,7 @@ class AnswerTests(unittest.TestCase):
     def test_no_run_identifier_or_missing_real_count_is_invented(self):
         result = {'status': 'ok', 'run_id': '20261116T020249Z-4574ceecd8',
                   'survey': {'rows': [{'group_id': 'overall', 'status': 'ok', 'estimate': .2}]}}
-        answer = build_analysis_answer(result, {'group_by': 'overall'})
+        answer = build_analysis_answer(result, {'group_by': 'overall'}, question='Show calculation details')
         self.assertIn('20.00%', answer)
         self.assertIn('Not recorded', answer)
         self.assertIn('A complete sample-flow record was not supplied', answer)
@@ -183,7 +213,7 @@ class AnswerTests(unittest.TestCase):
         self.assertNotIn('88.77', answer)
 
     def test_regression_or_references_sample_and_mi_are_recorded(self):
-        answer = build_analysis_answer(regression_fixture(), dict(SPEC, analysis='regression'))
+        answer = build_analysis_answer(regression_fixture(), dict(SPEC, analysis='regression'), question='Explain the model in detail')
         self.assertIn('OR is 2.400', answer)
         self.assertIn('4.100 | 2.400 | 1.800–3.200', answer)
         self.assertIn('Unadjusted OR, same sample', answer)
@@ -203,7 +233,7 @@ class AnswerTests(unittest.TestCase):
         answer = build_analysis_answer(result, dict(SPEC, analysis='regression'))
         self.assertNotIn('Unadjusted OR, same sample', answer)
         self.assertNotIn('use the same complete-case sample', answer)
-        self.assertIn('unadjusted-model sample size is 3,000', answer)
+        self.assertIn('Unadjusted n=3,000; identical membership is not confirmed', answer)
 
     def test_adjusted_or_interval_with_one_does_not_claim_no_conditional_effect(self):
         result = regression_fixture()
@@ -235,7 +265,7 @@ class AnswerTests(unittest.TestCase):
         result['survey']['methods']['proportion_ci'] = 'Rubin pooled t-Wald interval'
         result['survey']['denominators']['filtered_domain_n_range'] = {'min': 700, 'max': 740}
         result['survey']['rows'][0].update(n_range={'min': 100, 'max': 110}, pooled_df=50.5)
-        answer = build_analysis_answer(result, SPEC)
+        answer = build_analysis_answer(result, SPEC, question='Show all calculation steps in detail')
         self.assertIn('700–740', answer)
         self.assertIn('100–110', answer)
         self.assertIn('T=W+(1+1/m)B', answer)
@@ -261,7 +291,7 @@ class AnswerTests(unittest.TestCase):
         result['cache'] = {'hit': True, 'source_run_id': '20261116T020249Z-4574ceecd8'}
         answer = build_analysis_answer(result, SPEC)
         self.assertIn('R was not rerun', answer)
-        self.assertIn('original calculation', answer)
+        self.assertIn('cached survey result', answer)
         self.assertNotIn('20261116T020249Z-4574ceecd8', answer)
 
     def test_blocked_record_does_not_publish_any_estimates_or_executed_steps(self):

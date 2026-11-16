@@ -39,6 +39,16 @@ class DialogueTests(unittest.TestCase):
         self.assertEqual(args.kwargs['schema'],dialogue.SCHEMA)
         self.assertEqual(args.kwargs['max_output_tokens'],3200)
 
+    def test_style_guidance_is_conversational_and_batch_requests_remain_analysis_intent(self):
+        result,payload,args=self.call('Do all those comparisons.',
+            context={'has_published_result':True,'spec':{'analysis':'proportion','group_by':'education'}},
+            generated=response('analysis',''))
+        self.assertEqual(result['mode'],'analysis')
+        self.assertEqual(result['reply'],'')
+        self.assertIn('brief and conversational',args.args[1])
+        self.assertIn('do all those comparisons',args.args[1])
+        self.assertIn('fixed service resolves the requested batch',args.args[1])
+
     def test_name_and_preference_history_are_available_for_a_followup(self):
         history=[{'role':'user','content':'My name is Alice. I prefer short answers.'},
                  {'role':'assistant','content':'Nice to meet you, Alice.'}]

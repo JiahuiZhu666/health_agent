@@ -20,6 +20,7 @@ from .stats import _normalise_spec
 from .answers import build_analysis_answer, category_name, scope_name
 from .explanations import build_explanation
 from .jobs import ConversationBusy
+from .charts import chart_request, make_charts
 
 _CONVERSATION_ID = re.compile(r'[a-f0-9]{32}')
 _RUN_ID = re.compile(r'[0-9]{8}T[0-9]{6}Z-[a-f0-9]{10}')
@@ -221,7 +222,7 @@ def _uses_research_flow(text, context):
         if re.fullmatch(r'(?:女性|男性|female|male|women|men)(?:呢|only|的比例|[？?。.!！\s])*', q):
             return True
         if re.search(r'解释一下|详细一点|展开|和刚才|样本|为什么抑制|'
-                     r'explain (?:this|that|the results?)|what does (?:this|that|it) mean|'
+                     r'explain (?:this|that|these|the results?)|interpret (?:these|the) (?:charts?|plots?|graphs?)|what does (?:this|that|it) mean|'
                      r'break it down|more detail|walk me through|compared.*(?:last|previous)|'
                      r'which (?:published )?group.{0,20}(?:highest|lowest)|'
                      r'(?:highest|lowest).{0,15}(?:proportion|rate|group)|'
@@ -240,6 +241,48 @@ def _generation_metadata(value):
     fields = ('status','provider','model','response_id','request_id','usage','elapsed_ms',
               'http_status','error_code','message','api_status')
     return {key:copy.deepcopy(value[key]) for key in fields if key in value}
+
+
+def _conversation_only(text):
+    """Instructions about words and explicit refusals are not tool commands."""
+    q = text.lower().strip()
+    return bool(re.search(r'\b(?:translate|rewrite|proofread|paraphrase)\b|翻译|润色|改写|'
+                          r'\bexplain\s+(?:the\s+)?(?:instruction|phrase|sentence|request|word)|解释.{0,5}(?:这句话|这个指令|这个词)|'
+                          r'\b(?:do not|don.t|never|avoid|stop)\s+(?:\w+\s+){0,3}(?:compare|plot|draw|chart|calculate|run)|'
+                          r'(?:不要|别|不必|不用|无需).{0,8}(?:比较|计算|运行|画图|绘图|分析)', q))
+
+
+def _chart_groups(text):
+    q = re.sub(r'\b(?:sex|gender|education|income|race|age)\s+filters?\b|(?:性别|教育|收入|族裔|种族|年龄)筛选', '', text.lower())
+    return [name for name,pattern in _GROUP_PATTERNS.items() if re.search(pattern,q)]
+
+
+def _clear_chart_filters(text):
+    return bool(re.search(r'\b(?:remove|clear|no|without)\s+(?:(?:all|the|any|sex|gender|education|income|race|age)\s+)*filters?\b|'
+                          r'(?:取消|去掉|清空).{0,6}筛选|不限',text.lower()))
+
+
+def _batch_request(text, context, messages):
+    """Resolve an explicit request for all registered comparisons, not all topics."""
+    q = text.lower().strip()
+    all_groups = re.search(r'(?:all|every)\s+(?:(?:the|those|these|available|supported|population)\s+)?(?:comparisons?|groupings?|groups?|demographic groups?|analyses)|'
+                           r'\b(?:all|every)\b.{0,80}\b(?:comparisons?|groupings?|groups?|analyses)\b|'
+                           r'(?:全部|所有|每种).{0,10}(?:分组|比较|分析)|(?:都|全部).{0,4}(?:做|跑|算)(?:一遍|一下|一轮)?', q)
+    if not all_groups or re.search(r'\b(?:plot|chart|graph|visualiz\w*)\b|画图|绘图|图表|可视化', q):
+        return False
+    if context.get('last_turn_mode') == 'chat' and not re.search(r'\bnhis\b|self.?rated|fair.{0,5}poor|自评健康', q):
+        prior_user = next((str(item.get('content','')).lower() for item in reversed(messages) if item.get('role')=='user'), '')
+        if not re.search(r'\bnhis\b|self.?rated|自评健康|fair/poor', prior_user) and (context.get('pending') or {}).get('field') != 'comparisons':
+            return False
+    if context.get('spec') or (context.get('pending') or {}).get('field') == 'comparisons':
+        return True
+    if re.search(r'\bnhis\b|self.?rated|fair.{0,5}poor|自评健康', q):
+        return True
+    for message in reversed(messages[-8:]):
+        content = str(message.get('content', '')).lower()
+        if re.search(r'\bnhis\b|self.?rated|自评健康|fair/poor', content):
+            return True
+    return False
 
 
 class ConversationService:
@@ -396,7 +439,7 @@ class ConversationService:
         if not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id):
             return None
         path = self.root / 'runs' / run_id / 'result.json'
-        if path.is_symlink() or not path.is_file():
+        if path.parent.is_symlink() or path.is_symlink() or not path.is_file():
             return None
         try:
             if path.stat().st_size > 24 * 1024 * 1024:
@@ -412,6 +455,110 @@ class ConversationService:
             return value
         except (OSError, ValueError, UnicodeError):
             return None
+
+    def _discussed_results(self, conversation):
+        """Select only run references belonging to this conversation/workspace."""
+        identifiers = []
+        for message in conversation.get('messages', []):
+            if message.get('role') != 'assistant':
+                continue
+            source = message.get('source') or {}
+            candidates = [message.get('run_id'), source.get('run_id')]
+            candidates.extend(message.get('run_ids') or [])
+            candidates.extend(source.get('run_ids') or [])
+            for identifier in candidates:
+                if isinstance(identifier, str) and _RUN_ID.fullmatch(identifier) and identifier not in identifiers:
+                    identifiers.append(identifier)
+        results = []
+        for identifier in identifiers:
+            result = self._run(identifier)
+            if result and result.get('status') == 'ok':
+                results.append(result)
+        return results
+
+    def _chart_spec(self, text, conversation, routed):
+        """Use a named study grouping or the user's own recent study request."""
+        groups = _chart_groups(text)
+        context = conversation.get('context') or {}
+        clearing = _clear_chart_filters(text)
+        base = self._resolve(text, conversation, routed)[0] if (groups and routed.get('status')=='ready') or (clearing and context.get('spec')) else context.get('spec')
+        if base is None:
+            for message in reversed(conversation.get('messages', [])[:-1]):
+                if message.get('role') != 'user':
+                    continue
+                question = str(message.get('content', ''))
+                if (not re.search(r'\bnhis\b|self.?rated|自评健康|健康', question.lower())
+                        or not any(re.search(pattern, question.lower()) for pattern in _GROUP_PATTERNS.values())):
+                    continue
+                candidate = route(question)
+                if candidate.get('status') == 'ready':
+                    base = candidate['spec']
+                    break
+        if base is None:
+            return None
+        spec = _validated(base)
+        if clearing:
+            if groups:
+                spec['group_by'] = groups[0]
+            if re.search(r'\b(?:no|without)\s+(?:(?:any|all)\s+)?filters?\b|(?:clear|remove)\s+all\s+filters?|取消(?:所有|全部)筛选|清空筛选|不限',text.lower()):
+                spec['filters'] = {}
+            return _validated(spec)
+        scoped = route('Compare self-rated health by ' + spec['group_by'].replace('_',' ') + '. ' + text)
+        if scoped.get('status') == 'ready':
+            spec['filters'].update(copy.deepcopy(scoped['spec'].get('filters', {})))
+        return _validated(spec)
+
+    def _execute_analysis(self, spec, question, conversation, current, emit, *, measure_model=False, repeats=5, prompt_versions=3):
+        """Run one registered specification, preserving successful follow-up scope."""
+        context = conversation.setdefault('context', {})
+        emit({'stage':'understand','label':'Analysis specification confirmed','status':'complete','detail':_scope_label(spec),
+              'facts':{'group_by':spec['group_by'],'analysis':spec['analysis'],'filters':spec['filters']}})
+        try:
+            result = self.agent.analyze_spec(spec,question,measure_model=measure_model,repeats=repeats,
+                                             prompt_versions=prompt_versions,on_progress=emit)
+            if not isinstance(result, dict) or result.get('status') not in ('ok','blocked','clarify'):
+                raise ValueError('Unexpected analysis response')
+        except Exception:
+            emit({'stage':'analysis','label':'Statistical execution did not finish','status':'failed',
+                  'detail':'The analysis service failed. The unsuccessful specification was not made the basis for later follow-ups.'})
+            return None, 'The analysis did not finish and no new statistical result was published. The previous successful scope is still saved.', 'blocked', None
+        status = result.get('status', 'blocked')
+        answer = analysis_reply(result,spec,previous=current if current and current.get('status')=='ok' else None,question=question)
+        source = result.get('run_id')
+        if not isinstance(source,str) or not _RUN_ID.fullmatch(source):
+            source = None
+        if source:
+            context['last_attempt_run_id'] = source
+        if status == 'ok':
+            old_run = conversation.get('last_run_id')
+            if old_run and old_run != source:
+                context['previous_run_id'] = old_run
+            context['spec'] = copy.deepcopy(spec)
+            if source:
+                conversation['last_run_id'] = source
+        return result, answer, status, source
+
+    @staticmethod
+    def _chart_answer(charts, *, omitted=0, calculated=False):
+        if not charts:
+            return 'The saved results do not contain estimates that passed the checks needed for this chart. I have not filled in the missing values.'
+        intro = ('Here is the chart from the verified survey calculation.' if calculated and len(charts)==1 else
+                 'Here are the charts from the verified survey calculations.' if calculated else
+                 'Here is the chart from the result we discussed.' if len(charts)==1 else
+                 'Here are the results we discussed, shown as separate charts so their populations stay clear.')
+        lines = [intro]
+        if any(chart.get('kind') == 'proportion' for chart in charts):
+            lines.append('The markers show the weighted share reporting fair or poor health; the horizontal lines show the 95% confidence intervals.')
+        if any(chart.get('kind') == 'gradient' for chart in charts):
+            lines.append('The difference charts use percentage points, with zero marking no difference from the reference group.')
+        if any(chart.get('kind') == 'regression' for chart in charts):
+            lines.append('The forest plots show adjusted odds ratios and their 95% confidence intervals; one marks no association in the fitted model.')
+        if not calculated:
+            lines.append('I used the saved estimates, so no survey calculations or independent model measurements were rerun.')
+        if omitted:
+            lines.append('This view includes the most recent {} results; {} older results remain in the conversation records.'.format(len(charts),omitted))
+        lines.append('You can download each chart or open its source record below. These comparisons describe associations, not causal effects.')
+        return '\n\n'.join(lines)
 
     def _public(self, conversation):
         value = copy.deepcopy(conversation)
@@ -627,11 +774,16 @@ class ConversationService:
             current = self._run(context.get('last_attempt_run_id') or conversation.get('last_run_id'))
             previous = self._run(context.get('previous_run_id'))
             decision = None
+            charts = []
+            referenced_runs = []
+            conversation_only = _conversation_only(text)
+            plot_request = None if conversation_only else chart_request(text, has_results=True)
+            batch_requested = not conversation_only and _batch_request(text, context, conversation['messages'][:-1])
             chat_turn = False
             chat_reference_clarification = False
             initial_generation = None
             planner = getattr(self.agent, 'decide_reply', None)
-            if callable(planner) and '[credential hidden]' not in text and not _uses_research_flow(text, context):
+            if callable(planner) and '[credential hidden]' not in text and not plot_request and not batch_requested and (conversation_only or not _uses_research_flow(text, context)):
                 emit({'stage':'conversation','label':'Understand the conversation','status':'running',
                       'detail':'Use this conversation’s recent messages to distinguish chat from survey work.'})
                 try:
@@ -682,6 +834,103 @@ class ConversationService:
             elif routed.get('status') == 'blocked' and not explaining_floor:
                 answer, status, kind = routed['answer'], 'blocked', 'blocked'
                 emit({'stage':'scope','label':'Check the registered research scope','status':'blocked','detail':answer})
+            elif ((plot_request or batch_requested) and routed.get('status') == 'clarify' and routed.get('answer')
+                  and not routed['answer'].startswith(('For survey calculation,','Choose one grouping dimension,'))):
+                answer, status, kind = routed['answer'], 'clarify', 'clarification'
+                emit({'stage':'scope','label':'Confirm the requested chart population','status':'blocked','detail':answer})
+            elif plot_request and plot_request.get('scope') == 'latest' and current and current.get('status') != 'ok':
+                answer = 'The most recent analysis did not publish usable estimates, so there is no chart for that attempt. I can show the earlier published results if you ask for all the results we discussed.'
+                status, kind = 'blocked', 'visualization'
+                result, source_run_id = current, current.get('run_id')
+            elif plot_request:
+                kind = 'analysis'
+                emit({'stage':'visualize','label':'Prepare charts','status':'running',
+                      'detail':'Read released estimates referenced by this conversation, keeping each population separate.'})
+                selected = self._discussed_results(conversation)
+                named = _chart_groups(text)
+                if 'education_race' in named:
+                    named = ['education_race']
+                if named:
+                    selected = [item for item in selected if item.get('spec', {}).get('group_by') in named]
+                target_spec = self._chart_spec(text, conversation, routed)
+                scoped_route = route('Compare self-rated health by ' + ((target_spec or {}).get('group_by') or 'education').replace('_',' ') + '. ' + text)
+                requested_filters = (scoped_route.get('spec') or {}).get('filters', {})
+                if requested_filters and target_spec:
+                    requested_filters = target_spec.get('filters', {})
+                if requested_filters or _clear_chart_filters(text):
+                    def matching_filters(item):
+                        saved = item.get('spec', {}).get('filters') or {}
+                        normalize = lambda filters:{key:sorted(value if isinstance(value,list) else [value]) for key,value in filters.items()}
+                        return normalize(saved) == normalize(target_spec.get('filters', {}) if target_spec else requested_filters)
+                    selected = [item for item in selected if matching_filters(item)]
+                requested_kind = plot_request.get('kind', 'auto')
+                if requested_kind != 'auto':
+                    selected = [item for item in selected if item.get('spec', {}).get('analysis', 'proportion') == requested_kind]
+                if re.search(r'\bwomen\b|\bfemale\b|女性', text.lower()):
+                    selected = [item for item in selected if (item.get('spec', {}).get('filters') or {}).get('sex') in ('female', ['female'])]
+                elif re.search(r'\bmen\b|\bmale\b|男性', text.lower()):
+                    selected = [item for item in selected if (item.get('spec', {}).get('filters') or {}).get('sex') in ('male', ['male'])]
+                if plot_request.get('scope') == 'latest':
+                    selected = selected[-1:]
+                omitted = max(0, len(selected)-12)
+                selected = selected[-12:]
+                calculated = False
+                if not selected:
+                    spec = target_spec
+                    if spec is not None:
+                        if requested_kind in ('gradient', 'regression'):
+                            spec['analysis'] = requested_kind
+                            spec = _validated(spec)
+                        result, answer, status, source_run_id = self._execute_analysis(spec,text,conversation,current,emit)
+                        if result and status == 'ok':
+                            selected = [result]
+                            calculated = True
+                        elif result:
+                            kind = 'analysis'
+                    else:
+                        answer = ('I don’t have a published survey result to plot yet. I can start with education and self-rated health, '
+                                  'or compare all the registered population groups if you want an overview.')
+                        status, kind = 'clarify', 'clarification'
+                        context['pending'] = {'field':'comparisons','spec':copy.deepcopy(_DEFAULT_SPEC)}
+                if selected:
+                    charts = make_charts(selected,kind=requested_kind,style=plot_request.get('style','point'))
+                    referenced_runs = list(dict.fromkeys(item['source_run_id'] for item in charts))
+                    answer = self._chart_answer(charts,omitted=omitted,calculated=calculated)
+                    status, kind = ('ok','visualization') if charts else ('clarify','clarification')
+                    result, source_run_id = None, None
+                if charts:
+                    initial_generation = {'status':'local','type':'visualization',
+                                          'message':'Charts were constructed directly from released survey estimates.'}
+                emit({'stage':'visualize','label':'Charts ready' if charts else 'No chart was released',
+                      'status':'complete' if charts else 'blocked',
+                      'detail':'The chart values and confidence intervals come from the saved statistical records.' if charts else str(answer),
+                      'facts':{'chart_count':len(charts),'source_run_ids':referenced_runs,'reused_results':not calculated}})
+            elif batch_requested:
+                base = _validated(context.get('spec') or (context.get('pending') or {}).get('spec') or _DEFAULT_SPEC)
+                scope_route = route('Compare self-rated health by ' + base['group_by'].replace('_',' ') + '. ' + text)
+                base['filters'].update(copy.deepcopy((scope_route.get('spec') or {}).get('filters', {})))
+                context.pop('pending',None)
+                completed = []
+                sections = ['Here is an overview across education, income, sex, race/ethnicity, and age. I kept the current population filters and used the registered self-rated-health outcome.']
+                for group in ('education','income','sex','race','age'):
+                    spec = _validated(dict(base, group_by=group, analysis='proportion'))
+                    item, draft, item_status, identifier = self._execute_analysis(spec,text,conversation,current,emit)
+                    sections.append('### ' + GROUPS[group] + '\n\n' + str(draft).split('\n\n')[0])
+                    if identifier:
+                        referenced_runs.append(identifier)
+                    if item_status == 'ok' and item:
+                        completed.append(item)
+                charts = make_charts(completed)
+                if completed:
+                    status, kind = 'ok', 'analysis'
+                    if len(completed) != 5:
+                        sections.append('Some comparisons did not publish a usable result; their notices are listed above. Only released estimates appear in the charts.')
+                    sections.append('The charts show survey-weighted proportions and 95% confidence intervals. Income estimates pool all ten official imputations. These are descriptive associations, not causal effects. Open a chart’s source record for exact values and methods.')
+                else:
+                    status, kind = 'blocked', 'analysis'
+                    sections[0] = 'I attempted all five registered comparisons, but no statistical estimates passed the release checks.'
+                answer = '\n\n'.join(sections)
+                result, source_run_id = None, None
             elif greeting or help_question:
                 answer, status, kind = _HELP, 'ok', 'greeting' if greeting else 'help'
                 emit({'stage':'understand','label':'Identify the request','status':'complete','detail':'Help does not run survey calculations or blind measurement. Conversation generation is recorded separately.'})
@@ -698,6 +947,11 @@ class ConversationService:
                 status, kind = 'ok', 'acknowledgment'
                 emit({'stage':'reply','label':'Keep conversation context','status':'complete','detail':'An acknowledgment does not start survey calculations or blind measurement.'})
             elif explanation:
+                last_assistant = next((item for item in reversed(conversation['messages'][:-1]) if item.get('role')=='assistant'), {})
+                chart_sources = list(dict.fromkeys(item.get('source_run_id') for item in last_assistant.get('charts',[]) if isinstance(item,dict)))
+                explain_multiple = (len(chart_sources)>1 and re.search(r'\b(?:these|all|charts?|plots?|graphs?)\b|这些|所有|全部|这几',text.lower())
+                                    and not (routed.get('spec') or {}).get('filters')
+                                    and not any(re.search(pattern,text.lower()) for pattern in _GROUP_PATTERNS.values()))
                 incompatible = _explanation_target_mismatch(text, current)
                 if current and current.get('status') == 'ok' and routed.get('status') == 'ready':
                     requested = routed['spec'].get('filters', {})
@@ -709,12 +963,21 @@ class ConversationService:
                         have = have if isinstance(have,list) else [have]
                         if set(values) != set(have) and not set(values).issubset(observed_ids):
                             incompatible = True
-                if incompatible:
+                if explain_multiple:
+                    parts = ['Here is how to read the charts together. Each panel keeps its own grouping and population.']
+                    for identifier in chart_sources:
+                        item = self._run(identifier)
+                        if item and item.get('status') == 'ok':
+                            interpretation, _ = self._explain(text,item,None)
+                            parts.append('### ' + _scope_label(item.get('spec') or {}) + '\n\n' + interpretation)
+                            referenced_runs.append(identifier)
+                    answer, kind = '\n\n'.join(parts), 'explanation'
+                elif incompatible:
                     answer, kind = 'This explanation refers to a different population, grouping, or analysis from the saved result. Run the requested analysis first, such as an income gradient or a male-only comparison, so I can explain the matching evidence.', 'clarification'
                 else:
                     answer, kind = self._explain(text,current,previous)
                 status = 'clarify' if kind == 'clarification' else 'ok'
-                source_run_id = current.get('run_id') if current else None
+                source_run_id = current.get('run_id') if current and not explain_multiple else None
                 if source_run_id:
                     result = current
                 emit({'stage':'explain','label':'Explain the saved result','status':'complete' if status == 'ok' else 'blocked',
@@ -734,45 +997,23 @@ class ConversationService:
                         answer = 'Please choose the income-to-poverty category: below 100%, 100–199%, 200–399%, or 400% and above. I will keep the existing grouping and other filters.'
                     else:
                         answer = routed.get('answer') or 'Specify the research change, for example “women only,” “switch to income,” or “remove the sex filter.”'
+                        if not context.get('pending') and decision and decision.get('mode') == 'analysis' and not context.get('spec'):
+                            context['pending'] = {'field':'comparisons','spec':copy.deepcopy(_DEFAULT_SPEC)}
+                            answer = ('I can start with education and self-rated health, or give you an overview across education, income, sex, race/ethnicity, and age. '
+                                      'Say “compare all groups” if you want the full overview.')
                         if routed.get('status') == 'ready':
                             answer = 'There is no matching research context to continue, or the change is unclear. Ask a complete research question, such as “Compare self-rated health by education.”'
                     status, kind = 'clarify', 'clarification'
                     emit({'stage':'scope','label':'Confirm the analysis scope','status':'blocked','detail':answer})
                 else:
-                    emit({'stage':'understand','label':'Analysis specification confirmed','status':'complete','detail':_scope_label(spec),
-                          'facts':{'group_by':spec['group_by'],'analysis':spec['analysis'],'filters':spec['filters']}})
                     context.pop('pending',None)
-                    try:
-                        result = self.agent.analyze_spec(spec,text,measure_model=measure_model,repeats=repeats,
-                                                         prompt_versions=prompt_versions,on_progress=emit)
-                        if not isinstance(result, dict) or result.get('status') not in ('ok','blocked','clarify'):
-                            raise ValueError('Unexpected analysis response')
-                    except Exception:
-                        result = None
-                        answer, status, kind = 'The analysis did not finish and no new statistical result was published. The previous successful scope is still saved.','blocked','analysis'
-                        emit({'stage':'analysis','label':'Statistical execution did not finish','status':'failed','detail':'The analysis service failed. The unsuccessful specification was not made the basis for later follow-ups.'})
-                    else:
-                        status = result.get('status','blocked')
-                        answer = analysis_reply(result,spec,previous=current if current and current.get('status') == 'ok' else None,question=text)
-                        kind = 'analysis'
-                        source_run_id = result.get('run_id')
-                        if not isinstance(source_run_id,str) or not _RUN_ID.fullmatch(source_run_id):
-                            source_run_id = None
-                        if source_run_id:
-                            context['last_attempt_run_id'] = source_run_id
-                        if status == 'ok':
-                            old_run = conversation.get('last_run_id')
-                            if old_run and old_run != source_run_id:
-                                context['previous_run_id'] = old_run
-                            context['spec'] = copy.deepcopy(spec)
-                            if source_run_id and _RUN_ID.fullmatch(source_run_id):
-                                conversation['last_run_id'] = source_run_id
-                            else:
-                                source_run_id = None
-                        # Engine events may be returned even when no callback was emitted.
-                        if not any(event.get('stage') not in ('understand','scope') for event in process):
-                            for event in result.get('process') or []:
-                                emit(event)
+                    result, answer, status, source_run_id = self._execute_analysis(spec,text,conversation,current,emit,
+                        measure_model=measure_model,repeats=repeats,prompt_versions=prompt_versions)
+                    kind = 'analysis'
+                    # Engine events may be returned even when no callback was emitted.
+                    if result and not any(event.get('stage') not in ('understand','scope') for event in process):
+                        for event in result.get('process') or []:
+                            emit(event)
             if conversation['title'] in ('New chat', '\u65b0\u5bf9\u8bdd') and not greeting and not help_question:
                 conversation['title'] = text[:32] + ('…' if len(text)>32 else '')
             generation = initial_generation or {'status':'local', 'message':'This is a registered-scope or connection notice.'}
@@ -810,9 +1051,14 @@ class ConversationService:
             message = {'id':uuid.uuid4().hex,'role':'assistant','content':_redact(str(answer)),
                        'created_at':_now(),'status':status,'kind':kind,'process':process,'suggestions':suggestions,
                        'generation':generation}
+            if charts:
+                message['charts'] = charts
             if decision and (not chat_turn or chat_reference_clarification):
                 message['routing'] = _generation_metadata(decision)
-            if source_run_id:
+            if referenced_runs:
+                message['run_ids'] = referenced_runs
+                message['source'] = {'type':'runs','run_ids':referenced_runs}
+            elif source_run_id:
                 message['run_id'] = source_run_id
                 message['source'] = {'type':'run','run_id':source_run_id}
             else:
@@ -820,7 +1066,7 @@ class ConversationService:
             conversation['messages'].append(message)
             if kind == 'chat':
                 context['last_turn_mode'] = 'chat'
-            elif kind in ('analysis','explanation','method'):
+            elif kind in ('analysis','explanation','method','visualization'):
                 context['last_turn_mode'] = 'research'
             conversation['updated_at'] = _now()
             self._save(conversation)
@@ -835,6 +1081,12 @@ class ConversationService:
         context = conversation.get('context') or {}
         if context.get('pending',{}).get('field') == 'income':
             return ['Below 100% of poverty', '100–199% of poverty', '400% of poverty and above']
+        if context.get('pending',{}).get('field') == 'comparisons':
+            return ['Compare all groups', 'Compare self-rated health by education', 'Compare self-rated health by income']
+        if kind == 'visualization':
+            return ['Show bar charts', 'Explain these results', 'Compare all population groups']
         if conversation.get('last_run_id'):
-            return ['What about women?', 'Switch to income', 'Explain these results', 'What is the sample size?']
+            filtered = (context.get('spec') or {}).get('filters') or {}
+            return ['Plot all results we have discussed', 'How was this calculated?',
+                    'Remove the sex filter' if filtered.get('sex') else 'What about women?']
         return list(_SUGGESTIONS)

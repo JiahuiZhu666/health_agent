@@ -282,6 +282,56 @@ def _mi_info(survey, regression):
     return record, int(count) if finite(count) and count >= 1 and count == int(count) else None
 
 
+def detail_requested(question):
+    """Expand methods when requested, without making every result a lecture."""
+    return bool(re.search(
+        r'详细|一步步|计算步骤|计算过程|怎么算|怎么计算|如何计算|展开|'
+        r'\bdetailed\b|\bin detail\b|how.{0,45}calculat|step.by.step|break.{0,8}down|'
+        r'walk.{0,12}through|full (?:method|calculation)|show.{0,15}(?:work|steps)|explain.{0,15}method',
+        str(question or ''), re.I))
+
+
+def _method_summary(survey, spec, regression):
+    """Keep the result's relevant methods; do not invent missing execution facts."""
+    design, methods = survey.get('design') or {}, survey.get('methods') or {}
+    imputation, m = _mi_info(survey, regression)
+    full_design = ('The full adult survey design was retained before taking the analysis domain. '
+                   if design.get('constructed_before_domain_subset') is True else
+                   'The registered method retains the full adult design before domain analysis; its execution flag is absent here. ')
+    outcome = 'Fair/poor is PHSTAT_A=4/5; invalid responses are excluded.'
+    bullets = [full_design + outcome]
+    if regression.get('status') == 'ok':
+        model = 'Model: `' + _formula_name(regression['formula']) + '`. ' if regression.get('formula') else ''
+        n = _range_or_number(regression, 'n')
+        if n:
+            model += 'Complete-case n=' + n + '. '
+        if _same_sample(survey, regression):
+            model += 'Unadjusted and adjusted models use the same complete-case sample. '
+        elif _range_or_number(regression.get('unadjusted') or {}, 'n'):
+            model += 'Unadjusted n=' + _range_or_number(regression['unadjusted'], 'n') + '; identical membership is not confirmed. '
+        exclusions = _count(regression.get('complete_case_exclusions_range'))
+        if exclusions:
+            model += 'Relative to the category-filtered domain, complete-case exclusions total ' + exclusions + ', including missing outcomes. '
+        bullets.append(model.strip() or 'Only the returned coefficients and intervals are quoted.')
+    else:
+        uncertainty = 'Proportions are survey-weighted; n counts valid respondents. '
+        if 'taylor' in str(design.get('variance_method') or '').lower():
+            uncertainty += 'SEs account for strata and PSUs using Taylor linearization. '
+        ci_method = str(methods.get('proportion_ci') or '').lower()
+        if 't-wald' in ci_method or 'pooled t' in ci_method:
+            uncertainty += 'CIs use design or pooled t critical values. '
+        if _valid_contrasts(survey):
+            uncertainty += 'Difference intervals retain joint survey covariance.'
+        bullets.append(uncertainty.strip())
+    if m and m > 1:
+        bullets.append(('All 10 official income imputations' if m == 10 else 'The recorded ' + str(m) + ' imputations') +
+                       ' were pooled using Rubin’s rules, including within- and between-imputation uncertainty. '
+                       'The n range is across imputations, not extra respondents.')
+    elif imputation.get('required') is True:
+        bullets.append('Income imputation is required, but the combined imputation count is missing; completion of all 10 cannot be confirmed.')
+    return '\n'.join('- ' + text for text in bullets)
+
+
 def _method_steps(result, survey, spec, regression):
     design = survey.get('design') or {}
     methods = survey.get('methods') or {}
@@ -425,6 +475,7 @@ def build_analysis_answer(result, spec, previous=None, question=None):
     """
     result = result if isinstance(result, dict) else {}
     spec = spec if isinstance(spec, dict) else {}
+    detailed = detail_requested(question)
     survey = result.get('survey') or {}
     regression = survey.get('regression') or {}
     if (result.get('status') != 'ok' or survey.get('status') not in (None, 'ok') or
@@ -465,7 +516,8 @@ def build_analysis_answer(result, spec, previous=None, question=None):
         conclusion = 'No released group estimate is available to quote. Suppressed values are not used to rank groups or explain differences.'
     sections = ['**Conclusion:** ' + conclusion, scope_name(spec)]
     if _cache_hit(result, survey):
-        sections.append('This run reused a validated statistical result with matching data, specification, code and runtime versions; **R was not rerun**. The steps below explain the original calculation.')
+        sections.append('This run reused a validated statistical result with matching data, specification, code and runtime versions; **R was not rerun**. The steps below explain the original calculation.' if detailed else
+                        'This reuses a validated cached survey result; **R was not rerun**.')
     if regression.get('status') == 'ok':
         if terms:
             sections.append(_regression_table(survey, regression, terms))
@@ -488,7 +540,8 @@ def build_analysis_answer(result, spec, previous=None, question=None):
             lines.append('| {} | {} | {} to {} |'.format(_contrast_name(contrast), _pp(contrast['estimate']), _pp(contrast['ci_low']), _pp(contrast['ci_high'])))
         prefix = 'Only the first {} registered contrasts are shown here; the remainder are in the statistical details.\n\n'.format(len(chosen)) if len(contrasts) > len(chosen) else ''
         sections.append(prefix + '\n'.join(lines))
-    sections.append('### How the calculation works\n\n' + _method_steps(result, survey, spec, regression))
+    sections.append(('### How the calculation works\n\n' + _method_steps(result, survey, spec, regression)) if detailed else
+                    '**Method in brief**\n\n' + _method_summary(survey, spec, regression))
     interpretation = []
     if regression.get('status') == 'ok':
         interpretation.append('An OR compares odds, not the probability of poor health or a risk ratio. A multiplicative change in odds is not the same multiplicative change in probability. Changes between unadjusted and adjusted ORs do not establish an effect caused by a particular covariate.')
@@ -505,8 +558,24 @@ def build_analysis_answer(result, spec, previous=None, question=None):
                 interpretation.append('The listed registered difference intervals exclude 0, but these comparisons do not automatically receive a multiplicity adjustment. They do not establish a general or causal conclusion.')
         elif len(released) > 1:
             interpretation.append('The between-group gap is currently a descriptive point-estimate comparison. Overlap between the separate 95% CIs is not a test of that difference; the difference and its joint variance must be estimated separately.')
-    interpretation.append('A 95% CI describes a procedure that would cover the population parameter in about 95% of repeated samples under the same design and interval assumptions. It is not a range of individual health outcomes. Cross-sectional associations do not establish causation.')
-    sections.append('### How to interpret these results\n\n' + '\n\n'.join(interpretation))
+    if detailed:
+        interpretation.append('A 95% CI describes a procedure that would cover the population parameter in about 95% of repeated samples under the same design and interval assumptions. It is not a range of individual health outcomes. Cross-sectional associations do not establish causation.')
+        sections.append('### How to interpret these results\n\n' + '\n\n'.join(interpretation))
+    else:
+        if regression.get('status') == 'ok':
+            concise = ['OR compares odds, not the probability of poor health or a risk ratio.']
+            if terms:
+                first = terms[0]
+                concise.append('The interval includes the no-association reference value of 1; no association for this term under the registered adjusted model remains compatible with the data.' if first['ci_low'] <= 1 <= first['ci_high'] else
+                               'The interval excludes 1, supporting a conditional association under this model.')
+        elif contrasts:
+            concise = ['Differences are in percentage points. These exploratory comparisons have no automatic multiplicity adjustment.']
+        elif len(released) > 1:
+            concise = ['The gap is in percentage points. It is a point-estimate comparison; separate CIs do not test the difference.']
+        else:
+            concise = ['The CI describes sampling uncertainty in the group proportion.']
+        concise.append('Cross-sectional associations do not establish causation.')
+        sections.append(' '.join(concise))
     notes = []
     missing = _missing_notes(survey, spec)
     if missing:
@@ -515,11 +584,9 @@ def build_analysis_answer(result, spec, previous=None, question=None):
     if suppressed:
         reasons = list(dict.fromkeys(_suppression_reason(row.get('suppression_reason')) for row in suppressed))
         notes.append('{} group(s) are suppressed ({}); their values do not enter the conclusion or the model-gap comparison.'.format(len(suppressed), '; '.join(reasons)))
-    model = _model_note(result, rows)
+    model = _model_note(result, rows) if detailed or (result.get('measurement') or {}).get('status') not in ('not_requested', 'not_applicable') else ''
     if model:
         notes.append(model)
     if notes:
-        sections.append('### Denominators and completeness\n\n' + '\n\n'.join(notes))
-    if not contrasts and regression.get('status') != 'ok' and len(released) > 1 and spec.get('group_by') in ('education', 'income'):
-        sections.append('A useful next step is the registered {} gradient: compare each group with its reference using a proportion difference and interval.'.format(spec['group_by']))
+        sections.append(('### Denominators and completeness\n\n' if detailed else '') + '\n\n'.join(notes))
     return _RUN_ID.sub('the associated record', '\n\n'.join(sections))

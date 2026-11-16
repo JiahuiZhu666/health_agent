@@ -266,7 +266,7 @@ class ConversationTests(unittest.TestCase):
               {'group_id':'other','label':'未发布群体','status':'suppressed','estimate':.99,'n':4}]
         result={'status':'ok','run_id':'20261115T120000Z-0000000001','answer':'不应出现在简短答复中的整段计算日志\n'*100,
                 'survey':{'status':'ok','rows':rows},'measurement':{'status':'partial','valid_calls':4,'planned_calls':15}}
-        reply=analysis_reply(result,{'group_by':'education','filters':{'sex':'female'}})
+        reply=analysis_reply(result,{'group_by':'education','filters':{'sex':'female'}},question='Explain the calculation step by step')
         self.assertIn('###',reply)
         self.assertIn('Female',reply)
         self.assertIn('32.10%',reply)
@@ -285,7 +285,7 @@ class ConversationTests(unittest.TestCase):
             'gradient':{'contrasts':[
             {'group_id':'less_than_high_school','reference_id':'bachelors_plus','label':'未完成高中减本科及以上','status':'ok','estimate':.12,'ci_low':.08,'ci_high':.16}]}},
             'measurement':{'status':'not_requested'}}
-        reply=analysis_reply(result,{'group_by':'education','filters':{}})
+        reply=analysis_reply(result,{'group_by':'education','filters':{}},question='Explain the calculation step by step')
         self.assertRegex(reply, r'\+12\.00\s*percentage points')
         self.assertIn('+8.00 to +16.00',reply)
         self.assertIn('###',reply)

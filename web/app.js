@@ -11,7 +11,7 @@
   const conversationPattern = /^[a-f0-9]{32}$/;
   let storageKey = 'nhis_active_conversation_en_v2', accessScope = null;
   const mobile = window.matchMedia('(max-width: 768px)');
-  const runs = new Map(), conversations = new Map(), dialogOpeners = new WeakMap(), deletedConversationIds = new Set();
+  const runs = new Map(), conversations = new Map(), dialogOpeners = new WeakMap(), deletedConversationIds = new Set(), chartDownloadUrls = new Set();
   let state = null, activeConversation = null, lastResult = null;
   let busy = false, composing = false, currentJobId = null, generation = 0;
   let pollTimer = null, autoFollow = true, jobEvents = [], processSelection = 'live', publicRecordUrl = null;
@@ -115,6 +115,7 @@
       $('conversation-search').value = ''; $('load-run-id').value = ''; $('load-run-button').disabled = false; text($('history-error'), ''); text($('delete-description'), '');
       document.title = 'NHIS Lab · Chat and research'; showSystemError('');
       if (publicRecordUrl) { URL.revokeObjectURL(publicRecordUrl); publicRecordUrl = null; }
+      for (const url of chartDownloadUrls) URL.revokeObjectURL(url); chartDownloadUrls.clear();
       pendingDeletion = null; deleting = false; $('delete-confirm').disabled = false; $('delete-cancel').disabled = false;
       document.querySelectorAll('dialog[open]').forEach((dialog) => { if (dialog.id !== 'data-dialog') closeDialog(dialog); });
       setBusy(false);
@@ -271,6 +272,7 @@
   }
 
   function generationLabel(record) {
+    if (record?.type === 'visualization') return 'Data visualization';
     return record?.status === 'ok' ? 'Model response' : 'Local explanation';
   }
   function renderServiceStatus(dialogue = {}) {
@@ -314,6 +316,155 @@
     const label = String(event.label || '');
     return (!label || /\p{Script=Han}/u.test(label)) ? labels[event.stage] || 'Execution step' : label;
   }
+
+  function releasedChart(spec) {
+    const units = {proportion: 'percent', gradient: 'percentage_points', regression: 'odds_ratio'};
+    if (!spec || !Object.hasOwn(units, spec.kind) || spec.unit !== units[spec.kind] || !runPattern.test(spec.source_run_id || '') || (spec.status && spec.status !== 'ok')) return null;
+    const groups = asArray(spec.groups); if (!groups.length || groups.length > 80) return null;
+    const released = groups.filter((row) => {
+      if (!row || (row.status && row.status !== 'ok') || ![row.value, row.low, row.high].every(finite) || row.low > row.value || row.value > row.high) return false;
+      if (row.n !== undefined && (!Number.isInteger(row.n) || row.n < 100)) return false;
+      if (spec.kind === 'proportion') return row.low >= 0 && row.high <= 100;
+      if (spec.kind === 'gradient') return row.value >= -100 && row.value <= 100;
+      return row.low > 0 && Number.isFinite(Math.log(row.low)) && Number.isFinite(Math.log(row.high));
+    }).map((row) => ({...row, label: String(row.label || row.group_id || 'Unnamed group').slice(0, 240)}));
+    if (!released.length) return null;
+    return {...spec, title: String(spec.title || 'NHIS survey estimates').slice(0, 240), subtitle: String(spec.subtitle || '').slice(0, 600),
+      groups: released, omitted: groups.length - released.length, reference: spec.kind === 'regression' ? 1 : 0,
+      style: spec.kind === 'regression' ? 'forest' : spec.style === 'bar' ? 'bar' : 'point'};
+  }
+  function chartNumber(value, unit) {
+    const digits = unit === 'odds_ratio' ? 3 : unit === 'percentage_points' ? 2 : 1;
+    return finite(value) ? value.toFixed(digits) : '—';
+  }
+  function chartLines(value, maximum = 32) {
+    const lines = []; let line = '';
+    for (const word of String(value).split(/\s+/).filter(Boolean)) {
+      if (line && line.length + word.length + 1 > maximum) { lines.push(line); line = ''; }
+      if (word.length > maximum) { if (line) { lines.push(line); line = ''; } for (let i = 0; i < word.length; i += maximum) lines.push(word.slice(i, i + maximum)); }
+      else line += (line ? ' ' : '') + word;
+    }
+    if (line) lines.push(line);
+    return lines.length ? lines : [''];
+  }
+  function chartAxis(chart) {
+    const lows = chart.groups.map((row) => row.low), highs = chart.groups.map((row) => row.high);
+    if (chart.kind === 'regression') {
+      const low = Math.min(1, ...lows), high = Math.max(1, ...highs);
+      const minimum = Math.floor(Math.log2(low)), maximum = Math.max(minimum + 1, Math.ceil(Math.log2(high)));
+      const start = minimum, stop = maximum, span = stop - start;
+      const ticks = [...new Set([start, ...Array.from({length: 5}, (_, index) => Math.round(start + span * index / 4)), 0, stop])].filter((tick) => tick >= start && tick <= stop).sort((a, b) => a - b).map((tick) => 2 ** tick).filter((tick) => finite(tick) && tick > 0);
+      return {ticks, x: (value) => (Math.log2(value) - start) / span};
+    }
+    let low = chart.kind === 'gradient' ? Math.min(0, ...lows) : 0, high = Math.max(0, ...highs);
+    const rawLow = low, rawHigh = high;
+    const normalized = () => {
+      const scale = Math.max(1, Math.abs(rawLow), Math.abs(rawHigh)), start = rawLow / scale, span = rawHigh / scale - start;
+      return {ticks: Array.from({length: 5}, (_, index) => (start + span * index / 4) * scale).filter(finite), x: (value) => (value / scale - start) / span};
+    };
+    if (!finite(high - low)) return normalized();
+    const extent = Math.max(high - low, chart.kind === 'proportion' ? 10 : 1), raw = extent / 4;
+    const power = 10 ** Math.floor(Math.log10(raw)), factor = raw / power;
+    const step = (factor <= 1 ? 1 : factor <= 2 ? 2 : factor <= 2.5 ? 2.5 : factor <= 5 ? 5 : 10) * power;
+    low = Math.floor(low / step) * step; high = Math.ceil(high / step) * step;
+    if (!finite(low) || !finite(high) || !finite(high - low)) return normalized();
+    if (low === high) high = low + step;
+    const ticks = Array.from({length: Math.round((high - low) / step) + 1}, (_, index) => low + index * step);
+    return {ticks, x: (value) => (value - low) / (high - low)};
+  }
+  function chartSvg(chart) {
+    const svgNode = (tag, attributes = {}, content) => {
+      const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
+      for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value));
+      if (content !== undefined) text(node, content); return node;
+    };
+    const width = 760, left = 238, right = 536, valueX = 744, topTitle = chartLines(chart.title, 72), subtitle = chart.subtitle ? chartLines(chart.subtitle, 100) : [];
+    const header = 30 + topTitle.length * 22 + subtitle.length * 16 + 46;
+    const rowHeights = chart.groups.map((row) => Math.max(48, chartLines(row.label, 31).length * 16 + 20));
+    const height = header + rowHeights.reduce((sum, value) => sum + value, 0) + 94;
+    const svg = svgNode('svg', {xmlns: 'http://www.w3.org/2000/svg', viewBox: `0 0 ${width} ${height}`, width, height, role: 'img', 'aria-label': `${chart.title}. Estimates and 95% confidence intervals.`, 'font-family': 'Arial, Helvetica, sans-serif', 'font-size': 12, fill: '#212121'});
+    svg.append(svgNode('title', {}, chart.title), svgNode('desc', {}, 'Official NHIS survey estimates with 95% confidence intervals. Suppressed or invalid values are omitted.'), svgNode('rect', {x: 0, y: 0, width, height, fill: '#ffffff', rx: 12}));
+    let titleY = 28;
+    for (const line of topTitle) { svg.append(svgNode('text', {x: 16, y: titleY, 'font-size': 17, 'font-weight': 600}, line)); titleY += 22; }
+    for (const line of subtitle) { svg.append(svgNode('text', {x: 16, y: titleY - 2, 'font-size': 11, fill: '#646464'}, line)); titleY += 16; }
+    const legend = chart.kind === 'regression' ? 'Odds ratios and 95% confidence intervals · logarithmic scale' : chart.kind === 'gradient' ? 'Risk differences and 95% confidence intervals · percentage points' : `${chart.style === 'bar' ? 'Bars' : 'Points'}: survey estimates · lines: 95% confidence intervals`;
+    svg.append(svgNode('text', {x: 16, y: header - 28, fill: '#646464', 'font-size': 11}, legend), svgNode('text', {x: 16, y: header - 7, fill: '#757575', 'font-size': 10}, 'Population group'), svgNode('text', {x: valueX, y: header - 7, fill: '#757575', 'font-size': 10, 'text-anchor': 'end'}, 'Estimate (95% CI)'));
+    const axis = chartAxis(chart), bottom = height - 94, x = (value) => left + axis.x(value) * (right - left);
+    for (const tick of axis.ticks) {
+      const tickX = x(tick), label = chart.kind === 'regression' ? Number(tick.toPrecision(3)).toString() : Number(tick.toPrecision(6)).toString();
+      svg.append(svgNode('line', {x1: tickX, x2: tickX, y1: header + 2, y2: bottom + 3, stroke: '#ededed'}), svgNode('text', {x: tickX, y: bottom + 22, 'text-anchor': 'middle', fill: '#737373', 'font-size': 10}, label));
+    }
+    const referenceX = x(chart.reference);
+    svg.append(svgNode('line', {x1: referenceX, x2: referenceX, y1: header + 2, y2: bottom + 3, stroke: '#9b9b9b', 'stroke-dasharray': '4 4', 'data-reference': chart.reference}));
+    let rowTop = header;
+    chart.groups.forEach((row, index) => {
+      const y = rowTop + rowHeights[index] / 2, labels = chartLines(row.label, 31);
+      const group = svgNode('g', {'data-group-id': String(row.group_id || index), 'data-value': row.value, 'data-low': row.low, 'data-high': row.high});
+      group.append(svgNode('title', {}, `${row.label}: ${row.value} (95% CI ${row.low} to ${row.high})${row.n === undefined ? '' : `; n=${row.n}`}`));
+      labels.forEach((line, lineIndex) => group.append(svgNode('text', {x: 16, y: y + 4 + (lineIndex - (labels.length - 1) / 2) * 16, 'font-size': 11}, line)));
+      if (chart.style === 'bar') group.append(svgNode('rect', {x: Math.min(x(0), x(row.value)), y: y - 10, width: Math.abs(x(row.value) - x(0)), height: 20, fill: '#d5e5db', rx: 2, 'data-mark': 'bar'}));
+      group.append(svgNode('line', {x1: x(row.low), x2: x(row.high), y1: y, y2: y, stroke: '#6a927c', 'stroke-width': 2, 'data-mark': 'ci'}));
+      for (const end of [row.low, row.high]) group.append(svgNode('line', {x1: x(end), x2: x(end), y1: y - 5, y2: y + 5, stroke: '#6a927c', 'stroke-width': 1.5}));
+      group.append(svgNode('circle', {cx: x(row.value), cy: y, r: chart.kind === 'regression' ? 4.5 : 4, fill: '#28634f', stroke: '#ffffff', 'stroke-width': 1.5, 'data-mark': 'estimate'}));
+      group.append(svgNode('text', {x: valueX, y: y + 4, 'text-anchor': 'end', 'font-size': 11, 'font-variant-numeric': 'tabular-nums'}, `${chartNumber(row.value, chart.unit)} (${chartNumber(row.low, chart.unit)}–${chartNumber(row.high, chart.unit)})`));
+      svg.append(group); rowTop += rowHeights[index];
+    });
+    const suppliedLabel = String(chart.x_label || '').slice(0, 160);
+    const axisLabel = chart.kind === 'regression' ? `${suppliedLabel || 'Adjusted odds ratio (log scale)'} · reference = 1` : chart.kind === 'gradient' ? `${suppliedLabel || 'Difference (percentage points)'} · reference = 0` : suppliedLabel || 'Fair or poor self-rated health (%)';
+    svg.append(svgNode('text', {x: (left + right) / 2, y: bottom + 45, 'text-anchor': 'middle', 'font-size': 11}, axisLabel), svgNode('text', {x: 16, y: height - 19, fill: '#737373', 'font-size': 10}, `NHIS 2024 · Descriptive associations, not causal effects.${chart.omitted ? ` ${chart.omitted} unavailable group${chart.omitted === 1 ? '' : 's'} omitted.` : ''}`));
+    return {svg, width, height};
+  }
+  function chartFilename(chart, extension) {
+    return `nhis-${chart.source_run_id}-${chart.kind}-${chart.style}.${extension}`;
+  }
+  function downloadChartBlob(blob, filename) {
+    const url = URL.createObjectURL(blob); chartDownloadUrls.add(url);
+    const link = document.createElement('a'); link.href = url; link.download = filename; document.body.append(link);
+    try { link.click(); } finally { link.remove(); setTimeout(() => { URL.revokeObjectURL(url); chartDownloadUrls.delete(url); }, 1000); }
+  }
+  async function chartPng(markup, width, height) {
+    const blob = new Blob([markup], {type: 'image/svg+xml;charset=utf-8'});
+    let bitmap = null;
+    try {
+      if (typeof createImageBitmap === 'function') { try { bitmap = await createImageBitmap(blob); } catch (_) { /* Use a local data image when SVG bitmap decoding is unavailable. */ } }
+      if (!bitmap) bitmap = await new Promise((resolve, reject) => {
+        const image = new Image(), timer = setTimeout(() => reject(new Error('PNG conversion timed out.')), 10000);
+        image.onload = () => { clearTimeout(timer); resolve(image); }; image.onerror = () => { clearTimeout(timer); reject(new Error('PNG conversion is unavailable.')); };
+        image.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(markup)}`;
+      });
+      const canvas = document.createElement('canvas'), scale = Math.min(2, Math.sqrt(16000000 / (width * height)));
+      canvas.width = Math.round(width * scale); canvas.height = Math.round(height * scale);
+      const context = canvas.getContext('2d'); if (!context) throw new Error('PNG conversion is unavailable.');
+      context.fillStyle = '#ffffff'; context.fillRect(0, 0, canvas.width, canvas.height); context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      return await new Promise((resolve, reject) => canvas.toBlob((png) => png ? resolve(png) : reject(new Error('PNG conversion is unavailable.')), 'image/png'));
+    } finally { bitmap?.close?.(); }
+  }
+  function appendCharts(article, specs) {
+    const charts = asArray(specs).map(releasedChart).filter(Boolean); if (!charts.length) return;
+    const host = document.createElement('div'); host.className = 'inline-charts';
+    for (const chart of charts) {
+      const scope = accessScope, figure = document.createElement('figure'); figure.className = 'chat-chart';
+      const plot = chartSvg(chart), region = document.createElement('div'); region.className = 'chat-chart-scroll'; region.tabIndex = 0; region.setAttribute('role', 'region'); region.setAttribute('aria-label', chart.title); region.append(plot.svg); figure.append(region);
+      const caption = document.createElement('figcaption'), controls = document.createElement('div'), status = document.createElement('span'); caption.className = 'chat-chart-caption'; controls.className = 'chat-chart-actions'; status.className = 'chat-chart-status'; status.setAttribute('role', 'status');
+      for (const extension of ['svg', 'png']) {
+        const button = document.createElement('button'); button.type = 'button'; text(button, `Download ${extension.toUpperCase()}`); button.setAttribute('aria-label', `Download ${chart.title} as ${extension.toUpperCase()}`);
+        button.addEventListener('click', async () => {
+          if (scope !== accessScope || !figure.isConnected) return;
+          button.disabled = true; text(status, extension === 'png' ? 'Creating PNG…' : '');
+          try {
+            const markup = new XMLSerializer().serializeToString(plot.svg);
+            const blob = extension === 'svg' ? new Blob([markup], {type: 'image/svg+xml;charset=utf-8'}) : await chartPng(markup, plot.width, plot.height);
+            if (scope !== accessScope || !figure.isConnected) return;
+            downloadChartBlob(blob, chartFilename(chart, extension)); text(status, `${extension.toUpperCase()} download started.`);
+          } catch (_) { text(status, extension === 'png' ? 'PNG could not be created. Download SVG instead.' : 'The chart could not be downloaded. Please try again.'); }
+          finally { button.disabled = false; }
+        }); controls.append(button);
+      }
+      const source = document.createElement('button'); source.type = 'button'; text(source, 'Source ↗'); source.setAttribute('aria-label', `View the source analysis for ${chart.title}`); source.addEventListener('click', () => { if (scope === accessScope) openRun(chart.source_run_id); }); controls.append(source);
+      caption.append(controls, status); figure.append(caption); host.append(figure);
+    }
+    article.append(host);
+  }
   function appendMessage(role, value, status, metadata = {}) {
     if (role === 'assistant') value = displayMessage(value);
     const article = document.createElement('article'); article.className = `message ${role}`;
@@ -322,6 +473,7 @@
     const body = document.createElement('div'); body.className = 'message-body';
     if (role === 'user') text(body, value); else richText(body, value); article.append(body);
     if (role === 'assistant') {
+      appendCharts(article, metadata.charts);
       const actions = document.createElement('div'); actions.className = 'message-actions';
       const copy = document.createElement('button'); copy.type = 'button'; text(copy, 'Copy'); copy.setAttribute('aria-label', 'Copy this reply'); copy.addEventListener('click', () => copyReply(value, copy)); actions.append(copy);
       if (runPattern.test(metadata.run_id || '')) { const evidence = document.createElement('button'); evidence.type = 'button'; text(evidence, 'Research evidence ↗'); evidence.addEventListener('click', () => openRun(metadata.run_id)); actions.append(evidence); }

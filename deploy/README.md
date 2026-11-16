@@ -114,6 +114,7 @@ node tests/test_web_english.js
 node tests/test_web_markdown.js
 node tests/test_web_deletion.js
 node tests/test_web_public.js
+node tests/test_web_charts.js
 docker build --pull --tag nhis-lab:local .
 ```
 

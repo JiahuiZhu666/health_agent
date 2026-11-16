@@ -41,6 +41,7 @@ jobs:
           node tests/test_web_markdown.js
           node tests/test_web_deletion.js
           node tests/test_web_public.js
+          node tests/test_web_charts.js
 
   container:
     if: github.event_name == 'workflow_dispatch' && inputs.build_container

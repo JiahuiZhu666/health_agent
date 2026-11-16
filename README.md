@@ -59,11 +59,19 @@ You: Switch to income.
 Assistant: Changes the grouping and retains the sex filter.
 You: How did you calculate that?
 Assistant: Explains the saved result without rerunning survey statistics.
+You: Plot all results we have discussed.
+Assistant: Shows separate charts in the chat, preserving each result's population.
+You: Show bar charts.
+Assistant: Changes the presentation using the same saved estimates.
 ```
 
 Other supported requests include education × race/ethnicity comparisons, education or income gradients, and the registered logistic regression. “Low income” requires an explicit poverty cutoff; the application does not choose one silently.
 
-Research replies lead with a conclusion, show a compact result table, explain the calculation, and distinguish percentage points, uncertainty, and association. Income analyses explain multiple imputation; regression explains reference categories, complete cases, and odds ratios.
+Research replies lead with a conclusion and compact table, followed by brief methods and relevant qualifications. Ask “step by step,” “how was this calculated?” or “more detail” for the full calculation, denominators, and interval method. Income analyses retain multiple-imputation qualifications; regression distinguishes odds ratios from risks and causal effects.
+
+The web chat draws plots directly from released statistical records. Proportion charts include the recorded 95% confidence intervals; gradient charts use percentage points and a zero reference; adjusted odds-ratio forest plots use a logarithmic axis and a reference of one. Each panel has a source-record link and PNG/SVG downloads. Suppressed or invalid estimates never become plotted marks. Asking to plot existing results does not rerun R or blind measurement, and only results referenced by the current conversation are included. Large conversations show the most recent twelve matching results with an explicit notice about older records.
+
+“Compare all groups” or “都做一遍” runs the five registered comparisons: education, income, sex, race/ethnicity, and age. The overview keeps the current population filters and shows separate charts for released results. It does not start independent blind measurements. If only some comparisons finish, their successful results and the failures remain distinct. A request to translate or explain these instructions does not execute them.
 
 The model edits a structured, English evidence document. Numeric results, tables, formulas, and limitations are inserted unchanged from released statistical output. Every evidence block must appear once and retain its order. Added prose cannot introduce numbers or obvious unsupported directional, significance, causal, or clinical findings. These checks do not constitute general natural-language factual verification.
 
@@ -160,6 +168,7 @@ node tests/test_web_english.js
 node tests/test_web_markdown.js
 node tests/test_web_deletion.js
 node tests/test_web_public.js
+node tests/test_web_charts.js
 ```
 
 The independent Stata reference is `scripts/reference.do` and requires a licensed Stata installation. Its presence is not evidence that numerical agreement has been verified.
