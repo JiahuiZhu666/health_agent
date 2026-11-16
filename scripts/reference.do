@@ -3,25 +3,50 @@ clear all
 set more off
 set varabbrev off
 /* Independent Stata reference, not executed in this build environment.
-   Usage: do scripts/reference.do "data/adult24.csv" "runs/stata_reference.csv" "data/adultinc24.csv"
+   Usage: do scripts/reference.do "data/adult24.csv" "runs/stata_reference.csv" "data/adultinc24.csv" "fair_poor"
+   Optional fourth argument: fair_poor (default), insured, uninsured,
+   delayed_care_cost, or unmet_care_cost. Official 2024 codebook coding only.
    Fixed unfiltered age-25–64 marginal estimates. Match identical specs before comparing.
    No output from this script is accepted as verified merely because it exists. */
-args adult_csv output_csv income_csv
+args adult_csv output_csv income_csv outcome_id
+if `"`outcome_id'"' == "" local outcome_id "fair_poor"
+if !inlist(`"`outcome_id'"', "fair_poor", "insured", "uninsured", "delayed_care_cost", "unmet_care_cost") {
+    display as error "Choose a registered binary outcome. Arbitrary variables and formulas are not accepted."
+    exit 198
+}
+local outcome_variable "PHSTAT_A"
+if inlist(`"`outcome_id'"', "insured", "uninsured") local outcome_variable "NOTCOV_A"
+if `"`outcome_id'"' == "delayed_care_cost" local outcome_variable "MEDDL12M_A"
+if `"`outcome_id'"' == "unmet_care_cost" local outcome_variable "MEDNG12M_A"
+local item_variables "PHSTAT_A"
+if `"`outcome_variable'"' != "PHSTAT_A" local item_variables "PHSTAT_A `outcome_variable'"
 if `"`adult_csv'"' == "" | `"`output_csv'"' == "" {
     display as error "Supply the official adult CSV and output CSV paths."
     exit 198
 }
 log using `"`output_csv'.log"', text replace
 import delimited using `"`adult_csv'"', varnames(1) case(upper) stringcols(_all) clear
-keep SRVY_YR RECTYPE HHX WTFA_A PSTRAT PPSU AGEP_A PHSTAT_A EDUCP_A HISPALLP_A SEX_A
-destring SRVY_YR RECTYPE WTFA_A PSTRAT PPSU AGEP_A PHSTAT_A EDUCP_A HISPALLP_A SEX_A, replace
+keep SRVY_YR RECTYPE HHX WTFA_A PSTRAT PPSU AGEP_A `item_variables' EDUCP_A HISPALLP_A SEX_A
+destring SRVY_YR RECTYPE WTFA_A PSTRAT PPSU AGEP_A `item_variables' EDUCP_A HISPALLP_A SEX_A, replace
 assert _N == 32629
 assert SRVY_YR == 2024 & RECTYPE == 10
 isid HHX
 assert WTFA_A > 0 & WTFA_A < . & !missing(PSTRAT, PPSU)
-generate byte fair_poor = inlist(PHSTAT_A, 4, 5) if inrange(PHSTAT_A, 1, 5)
+/* Item refusal, unascertained, unknown, and blank/skip values stay missing.
+   NOTCOV_A is the edited coverage recode (1 uninsured, 2 insured).
+   MEDDL12M_A/MEDNG12M_A concern cost-related care access in the past 12 months. */
+generate byte outcome_value = .
+if `"`outcome_id'"' == "fair_poor" {
+    replace outcome_value = inlist(PHSTAT_A, 4, 5) if inrange(PHSTAT_A, 1, 5)
+}
+else if `"`outcome_id'"' == "insured" {
+    replace outcome_value = (NOTCOV_A == 2) if inlist(NOTCOV_A, 1, 2)
+}
+else {
+    replace outcome_value = (`outcome_variable' == 1) if inlist(`outcome_variable', 1, 2)
+}
 /* Safe zero only outside a valid-outcome subpopulation preserves the full design. */
-generate byte outcome_safe = cond(missing(fair_poor), 0, fair_poor)
+generate byte outcome_safe = cond(missing(outcome_value), 0, outcome_value)
 generate byte education = .
 replace education = 1 if inrange(EDUCP_A, 0, 2)
 replace education = 2 if inlist(EDUCP_A, 3, 4)
@@ -47,7 +72,7 @@ capture program drop reference_cell
 program define reference_cell, rclass
     syntax, Condition(string)
     tempvar good psutag stratumtag
-    generate byte `good' = domain & (`condition') & !missing(fair_poor)
+    generate byte `good' = domain & (`condition') & !missing(outcome_value)
     quietly count if `good'
     local sample_n = r(N)
     egen byte `psutag' = tag(PSTRAT PPSU) if `good'
@@ -91,12 +116,13 @@ foreach eid of local education_ids {
 }
 postclose `results'
 use `reference', clear
+generate str24 outcome = `"`outcome_id'"'
 format estimate se ci_low ci_high %21.15g
 export delimited using `"`output_csv'"', replace
 
 /* Explicit reduced model, on one common complete-case domain. Log output only. */
 use `adult', clear
-generate byte complete_no_income = domain & !missing(fair_poor, education, age, sex, race)
+generate byte complete_no_income = domain & !missing(outcome_value, education, age, sex, race)
 svy, subpop(complete_no_income): logit outcome_safe ib4.education
 svy, subpop(complete_no_income): logit outcome_safe ib4.education ib1.age ib2.sex ib2.race
 
@@ -132,7 +158,7 @@ if `"`income_csv'"' != "" {
             reference_cell, condition("income == `category'")
             post `byimp' (`m') (`category') (r(n)) (r(estimate)) (r(se)^2) (r(df))
         }
-        generate byte complete_full = domain & !missing(fair_poor, education, age, sex, race, income)
+        generate byte complete_full = domain & !missing(outcome_value, education, age, sex, race, income)
         /* Exactly the same sample in the two models within this imputation. */
         svy, subpop(complete_full): logit outcome_safe ib4.education
         estimates save `"`output_csv'.unadjusted_imp`m'.ster"', replace
@@ -141,6 +167,7 @@ if `"`income_csv'"' != "" {
     }
     postclose `byimp'
     use `byimp_file', clear
+    generate str24 outcome = `"`outcome_id'"'
     export delimited using `"`output_csv'.income_by_imputation.csv"', replace
     /* Scalar Rubin pooling, independently expressed in Stata. The complete-data
        df correction matches mitools MIcombine's finite-df formula, not merely
@@ -166,7 +193,7 @@ if `"`income_csv'"' != "" {
     replace group_id = "100_199" if income == 2
     replace group_id = "200_399" if income == 3
     replace group_id = "400_plus" if income == 4
-    keep group_id n_min n_max estimate se ci_low ci_high pooled_df within between
+    keep outcome group_id n_min n_max estimate se ci_low ci_high pooled_df within between
     rename n_min n
     format estimate se ci_low ci_high %21.15g
     export delimited using `"`output_csv'.income_pooled.csv"', replace

@@ -7,6 +7,18 @@ write_result <- function(x) write_json(x, args[[3]], pretty = TRUE, auto_unbox =
                                      null = "null", na = "null", digits = 15)
 blocked <- function(code, reason) list(status = "blocked", code = code, reason = reason,
                                      rows = list(), checks = list())
+# Only registry-selected response values are recoded; missing/skip values stay NA.
+recode_binary <- function(raw, one, zero) {
+  answer <- rep(NA_real_, length(raw))
+  answer[!is.na(raw) & raw %in% zero] <- 0
+  answer[!is.na(raw) & raw %in% one] <- 1
+  answer
+}
+# Formulas contain only fixed, reviewed variable names, never user formula text.
+fixed_model_formula <- function(adjust_income) {
+  covariates <- c("education", "age", "sex", "race", if (adjust_income) "income")
+  reformulate(covariates, response = "outcome_value")
+}
 warning_log <- character()
 main <- function() {
   suppressPackageStartupMessages(library(survey))
@@ -14,11 +26,25 @@ main <- function() {
   options(survey.lonely.psu = "fail", survey.adjust.domain.lonely = FALSE)
   spec <- read_json(args[[2]], simplifyVector = FALSE)
   registry <- read_json(args[[4]], simplifyVector = FALSE)
-  if (spec$year != 2024 || spec$outcome != "fair_poor") stop("Unverified year or outcome")
+  if (spec$year != 2024 || !is.character(spec$outcome) || length(spec$outcome) != 1L ||
+      !spec$outcome %in% c("fair_poor", "insured", "uninsured", "delayed_care_cost", "unmet_care_cost") ||
+      !spec$outcome %in% names(registry$outcomes)) stop("Unverified year or outcome")
+  outcome <- registry$outcomes[[spec$outcome]]
+  outcome_variable <- outcome$variable
+  one_codes <- as.numeric(unlist(outcome$one))
+  zero_codes <- as.numeric(unlist(outcome$zero))
+  missing_codes <- as.numeric(unlist(outcome$missing))
+  if (!is.character(outcome_variable) || length(outcome_variable) != 1L ||
+      !outcome_variable %in% c("PHSTAT_A", "NOTCOV_A", "MEDDL12M_A", "MEDNG12M_A") ||
+      !length(one_codes) || !length(zero_codes) ||
+      any(!is.finite(c(one_codes, zero_codes, missing_codes))) ||
+      anyDuplicated(c(one_codes, zero_codes, missing_codes))) stop("Invalid registered binary outcome coding")
   if (!spec$analysis %in% c("proportion", "gradient", "regression")) stop("Unsupported analysis")
   if (spec$min_n < 100) stop("Minimum denominator cannot be below 100")
   needed <- c("SRVY_YR", "RECTYPE", "HHX", "WTFA_A", "PSTRAT", "PPSU", "AGEP_A",
               "PHSTAT_A", "EDUCP_A", "HISPALLP_A", "SEX_A")
+  needed <- unique(c(needed, outcome_variable))
+  structural <- c("SRVY_YR", "RECTYPE", "HHX", "WTFA_A", "PSTRAT", "PPSU")
   read_selected <- function(path, keep) {
     header <- names(read.csv(path, nrows = 0L, check.names = FALSE))
     if (!all(keep %in% header) || anyDuplicated(header)) stop("Invalid official CSV columns")
@@ -27,7 +53,7 @@ main <- function() {
   }
   base <- read_selected(args[[1]], needed)
   for (v in setdiff(needed, "HHX")) base[[v]] <- as.numeric(base[[v]])
-  if (nrow(base) != registry$datasets$adult_2024$expected_rows || anyNA(base[needed]) ||
+  if (nrow(base) != registry$datasets$adult_2024$expected_rows || anyNA(base[structural]) ||
       any(base$SRVY_YR != 2024) || any(base$RECTYPE != 10) || anyDuplicated(base$HHX))
     stop("Expected the complete unique 2024 Sample Adult release")
   if (any(!is.finite(base$WTFA_A) | base$WTFA_A <= 0)) stop("Invalid survey weights")
@@ -43,7 +69,7 @@ main <- function() {
     }
     factor(answer, levels = vapply(groups, function(g) g$id, character(1)))
   }
-  base$fair_poor <- ifelse(base$PHSTAT_A %in% 1:5, as.numeric(base$PHSTAT_A %in% c(4, 5)), NA_real_)
+  base$outcome_value <- recode_binary(base[[outcome_variable]], one_codes, zero_codes)
   base$education <- recode(base$EDUCP_A, "education")
   base$race <- recode(base$HISPALLP_A, "race")
   base$sex <- recode(base$SEX_A, "sex")
@@ -143,9 +169,9 @@ main <- function() {
       d <- designs[[m]]
       yes <- cell_match(d, combination)
       eligible[m] <- sum(yes)
-      good <- yes & !is.na(d$variables$fair_poor)
+      good <- yes & !is.na(d$variables$outcome_value)
       n[m] <- sum(good)
-      events[m] <- sum(d$variables$fair_poor[good])
+      events[m] <- sum(d$variables$outcome_value[good])
       weight_sums[m] <- sum(weights(d)[good])
       cell <- d[good, ]
       cells[[m]] <- cell
@@ -163,7 +189,7 @@ main <- function() {
                    status = "suppressed", suppression_reason = NULL, design_df = min(dfs))
     if (!length(reasons)) {
       for (m in seq_along(cells)) {
-        mean_fit <- svymean(~fair_poor, cells[[m]], na.rm = TRUE)
+        mean_fit <- svymean(~outcome_value, cells[[m]], na.rm = TRUE)
         estimates[m] <- as.numeric(coef(mean_fit)[1])
         variances[m] <- as.numeric(vcov(mean_fit)[1, 1])
       }
@@ -193,22 +219,26 @@ main <- function() {
     rows[[length(rows) + 1L]] <- output
     internal_cells[[id]] <- list(combination = combination, cells = cells, row = output)
   }
-  valid_outcome <- vapply(designs, function(d) sum(!is.na(d$variables$fair_poor)), integer(1))
-  missingness <- lapply(c("fair_poor", "education", "race", "sex", "age_years"), function(v)
+  valid_outcome <- vapply(designs, function(d) sum(!is.na(d$variables$outcome_value)), integer(1))
+  missingness <- lapply(c("outcome_value", "education", "race", "sex", "age_years"), function(v)
     count_range(vapply(designs, function(d) sum(is.na(d$variables[[v]])), integer(1))))
   names(missingness) <- c("outcome", "education", "race", "sex", "age")
-  raw_variables <- c("PHSTAT_A", "EDUCP_A", "HISPALLP_A", "SEX_A", "AGEP_A")
+  raw_variables <- unique(c(outcome_variable, "EDUCP_A", "HISPALLP_A", "SEX_A", "AGEP_A"))
   audit_missing_codes <- function(frames) {
     audit <- lapply(raw_variables, function(v) {
-      special <- if (v %in% c("PHSTAT_A", "SEX_A")) c(7, 8, 9) else c(97, 98, 99)
-      valid <- switch(v, PHSTAT_A = 1:5, EDUCP_A = 0:10, HISPALLP_A = 1:7, SEX_A = 1:2, AGEP_A = 18:85)
+      special <- if (v %in% c(outcome_variable, "SEX_A")) c(7, 8, 9) else c(97, 98, 99)
+      valid <- if (v == outcome_variable) c(one_codes, zero_codes) else
+        switch(v, EDUCP_A = 0:10, HISPALLP_A = 1:7, SEX_A = 1:2, AGEP_A = 18:85)
+      registered_missing <- if (v == outcome_variable) missing_codes else special
       count_code <- function(code) count_range(vapply(frames, function(f) sum(f[[v]] %in% code), integer(1)))
       list(refused = list(code = special[1], n_range = count_code(special[1])),
            not_ascertained = list(code = special[2], n_range = count_code(special[2])),
            dont_know = list(code = special[3], n_range = count_code(special[3])),
+           registered_missing_codes = as.list(registered_missing),
+           other_registered_missing_n_range = count_code(setdiff(registered_missing, special)),
            blank_n_range = count_range(vapply(frames, function(f) sum(is.na(f[[v]])), integer(1))),
            other_invalid_n_range = count_range(vapply(frames, function(f)
-             sum(!is.na(f[[v]]) & !f[[v]] %in% c(valid, special)), integer(1))))
+             sum(!is.na(f[[v]]) & !f[[v]] %in% c(valid, registered_missing)), integer(1))))
     })
     names(audit) <- raw_variables
     audit
@@ -218,7 +248,7 @@ main <- function() {
     age_domain = audit_missing_codes(list(base[age_eligible, , drop = FALSE])),
     filtered_domain = audit_missing_codes(lapply(designs, function(d) d$variables)),
     note = "Age-unknown records cannot enter the age domain; full-sample age missingness is therefore retained separately. Ranges span income imputations when relevant.")
-  answer <- list(status = "ok", rows = rows,
+  answer <- list(status = "ok", rows = rows, outcome = c(list(id = spec$outcome), outcome),
                  denominators = list(full_sample_n = nrow(base), age_domain_n = as.integer(age_counts[1]),
                                      filtered_domain_n = as.integer(min(d_n)), filtered_domain_n_range = count_range(d_n),
                                      valid_outcome_n = as.integer(min(valid_outcome)), valid_outcome_n_range = count_range(valid_outcome),
@@ -265,15 +295,15 @@ main <- function() {
           q <- u <- dfc <- numeric()
           for (m in seq_along(designs)) {
             d <- designs[[m]]
-            keep <- !is.na(d$variables[[gradient_variable]]) & !is.na(d$variables$fair_poor)
+            keep <- !is.na(d$variables[[gradient_variable]]) & !is.na(d$variables$outcome_value)
             if (!is.na(race_id)) keep <- keep & !is.na(d$variables$race) & as.character(d$variables$race) == race_id
             d <- d[keep, ]
-            fit <- svyby(~fair_poor, as.formula(paste("~", gradient_variable)), d, FUN = svymean, na.rm = TRUE,
+            fit <- svyby(~outcome_value, as.formula(paste("~", gradient_variable)), d, FUN = svymean, na.rm = TRUE,
                          covmat = TRUE, keep.var = TRUE, drop.empty.groups = TRUE)
             ids <- as.character(fit[[gradient_variable]])
             a <- match(target, ids); b <- match(reference, ids)
             covariance <- vcov(fit)
-            q[m] <- fit$fair_poor[a] - fit$fair_poor[b]
+            q[m] <- fit$outcome_value[a] - fit$outcome_value[b]
             u[m] <- covariance[a, a] + covariance[b, b] - 2 * covariance[a, b]
             dfc[m] <- degf(d)
           }
@@ -298,8 +328,8 @@ main <- function() {
     }
   }
   if (spec$analysis == "regression") {
-    formula_text <- if (adjust_income) registry$regression$full_formula else registry$regression$reduced_formula
-    formula <- as.formula(formula_text)
+    formula <- fixed_model_formula(adjust_income)
+    formula_text <- paste(spec$outcome, "~", paste(attr(terms(formula), "term.labels"), collapse = " + "))
     block_model <- function(reason) {
       answer$status <- "blocked"; answer$code <- "regression_gate_failed"; answer$reason <- reason
       answer$rows <- list()
@@ -317,7 +347,7 @@ main <- function() {
       d <- designs[[m]]
       use <- complete.cases(d$variables[all.vars(formula)])
       d <- d[use, ]
-      model_n[m] <- nrow(d$variables); model_events[m] <- sum(d$variables$fair_poor)
+      model_n[m] <- nrow(d$variables); model_events[m] <- sum(d$variables$outcome_value)
       if (model_n[m] < spec$min_n) return(block_model("Insufficient complete-case model denominator"))
       factors <- c("education", "age", "sex", "race", if (adjust_income) "income")
       for (v in factors) {
@@ -325,14 +355,14 @@ main <- function() {
         ref <- registry$regression$references[[v]]
         if (nlevels(d$variables[[v]]) < 2 || !ref %in% levels(d$variables[[v]]))
           return(block_model(paste("Model factor", v, "lacks variation or its prespecified reference category in the filtered domain")))
-        counts <- table(d$variables[[v]], d$variables$fair_poor)
+        counts <- table(d$variables[[v]], d$variables$outcome_value)
         if (ncol(counts) != 2 || any(counts < 10))
           return(block_model(paste("Sparse model cells in", v, "(<10 events/non-events); separation risk")))
         d$variables[[v]] <- relevel(d$variables[[v]], ref = ref)
       }
       # Both models use this identical complete-case survey domain, within every imputation.
       fit <- svyglm(formula, design = d, family = quasibinomial(link = "logit"))
-      unadjusted <- svyglm(fair_poor ~ education, design = d, family = quasibinomial(link = "logit"))
+      unadjusted <- svyglm(outcome_value ~ education, design = d, family = quasibinomial(link = "logit"))
       if (!fit_valid(fit, model_n[m], model_events[m]) || !fit_valid(unadjusted, model_n[m], model_events[m]))
         return(block_model("Adjusted or unadjusted model failed convergence, rank, coefficient stability, events-per-parameter, or residual-design-df gate"))
       fits[[m]] <- fit; unadjusted_fits[[m]] <- unadjusted
@@ -363,7 +393,7 @@ main <- function() {
       references = registry$regression$references,
       adjustment = if (adjust_income) "Education, age group, sex, race/ethnicity, and income-to-poverty category; all 10 income imputations pooled" else "Explicit reduced model: education, age group, sex, and race/ethnicity; income excluded (income domains still require all 10 imputations)",
       income_adjusted = adjust_income, imputation_count = length(fits),
-      unadjusted = list(formula = "fair_poor ~ education", coefficients = unadjusted_coefficients,
+      unadjusted = list(formula = paste(spec$outcome, "~ education"), coefficients = unadjusted_coefficients,
         n = as.integer(min(model_n)), n_range = count_range(model_n),
         sample = "Identical complete-case domain as the adjusted model within each imputation"),
       variance_method = "Design-based sandwich covariance; pooled log-odds and complete covariance matrices when multiply imputed",

@@ -1,6 +1,7 @@
 """Readable, source-bound analysis answers; no statistics or model calls run here."""
 import math
 import re
+from .outcomes import get_outcome, outcome_label, allowed_outcomes
 
 LABELS = {
     'overall': 'Overall', 'all': 'Overall',
@@ -22,6 +23,37 @@ _SECRET = re.compile(r'\bsk-[A-Za-z0-9_-]{12,}')
 
 def finite(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def outcome_metadata(spec=None):
+    return get_outcome((spec or {}).get('outcome', 'fair_poor'))
+
+
+def outcome_caution(spec=None):
+    code = (spec or {}).get('outcome', 'fair_poor')
+    return str(get_outcome(code).get('limitation', '')) if code != 'fair_poor' else ''
+
+
+def outcome_coding(spec=None):
+    record = outcome_metadata(spec)
+    positive = ', '.join(str(value) for value in record['one'])
+    negative = ', '.join(str(value) for value in record['zero'])
+    return ('{} The current registered analysis is restricted to adults aged 25–64. Code `{}={}` as 1 for **{}**, and `{}` as 0. Only these listed valid responses enter the outcome denominator; '
+            'refused, not-ascertained, don’t-know and any other unlisted codes are excluded, not treated as negative events.').format(
+                record.get('definition') or record['label'] + '.', record['variable'], positive, record['label'], negative)
+
+
+def outcome_matches(survey, spec):
+    """New events must carry their own source descriptor, never relabel old rows."""
+    code = (spec or {}).get('outcome', 'fair_poor')
+    if code not in allowed_outcomes():
+        return False
+    descriptor = survey.get('outcome')
+    if not isinstance(descriptor, dict):
+        return code == 'fair_poor'
+    recorded = descriptor.get('id', descriptor.get('code'))
+    return (recorded in (None, code) and descriptor.get('variable', outcome_metadata(spec)['variable']) == outcome_metadata(spec)['variable']
+            and (code == 'fair_poor' or recorded == code))
 
 
 def _safe(value):
@@ -62,6 +94,8 @@ def scope_name(spec):
             restrictions.append(', '.join(category_name(item) for item in values))
     if restrictions:
         parts.append('Restricted to ' + ', '.join(restrictions))
+    if spec.get('outcome', 'fair_poor') in allowed_outcomes() and spec.get('outcome', 'fair_poor') != 'fair_poor':
+        parts.append('Outcome: ' + outcome_label(spec['outcome']))
     return '; '.join(parts) + '. ' if parts else 'The population is defined by the registered analysis specification.'
 
 
@@ -114,7 +148,7 @@ def _suppression_reason(value):
     return ', '.join(dict.fromkeys(known)) if known else 'Did not pass publication checks'
 
 
-def _rate_table(rows, cross=False):
+def _rate_table(rows, cross=False, outcome=None):
     chosen = list(rows)
     intro = ''
     if cross or len(chosen) > 6:
@@ -138,7 +172,8 @@ def _rate_table(rows, cross=False):
         intro = ('The table shows only {} illustrative groups, including the highest and lowest released estimates '
                  'and a suppression example when available. It is not a complete ranking; '
                  'the remaining groups are in the statistical details.\n\n').format(len(chosen))
-    lines = ['| Group | Valid n | Weighted proportion | SE (percentage points) | 95% CI |',
+    rate_label = 'Weighted proportion' if not outcome else 'Weighted proportion: ' + _safe(outcome)
+    lines = ['| Group | Valid n | ' + rate_label + ' | SE (percentage points) | 95% CI |',
              '|---|---:|---:|---:|---|']
     for row in chosen:
         count = _range_or_number(row, 'n') or 'Not recorded'
@@ -201,8 +236,8 @@ def _regression_terms(regression, question=None):
 
 def _formula_name(value):
     text = str(value or '')
-    return re.sub(r'\b(?:fair_poor|education|income|race|sex|age_years|age)\b',
-                  lambda match: VARIABLES[match.group()], text)
+    names = dict(VARIABLES, **{code: outcome_label(code) for code in allowed_outcomes() if code != 'fair_poor'})
+    return re.sub(r'\b(?:' + '|'.join(re.escape(key) for key in names) + r')\b', lambda match: names[match.group()], text)
 
 
 def _same_sample(survey, regression):
@@ -214,10 +249,11 @@ def _same_sample(survey, regression):
     return confirmed and not (finite(n) and finite(other_n) and n != other_n)
 
 
-def _regression_table(survey, regression, terms):
+def _regression_table(survey, regression, terms, outcome=None):
     unadjusted = {term.get('term'): term for term in (regression.get('unadjusted') or {}).get('coefficients', []) if _valid_or(term)}
     label = 'Unadjusted OR, same sample' if _same_sample(survey, regression) else 'Unadjusted OR'
-    lines = ['| Model term | ' + label + ' | Adjusted OR | Adjusted 95% CI |', '|---|---:|---:|---|']
+    adjusted = 'Adjusted OR' if not outcome else 'Adjusted OR: ' + _safe(outcome)
+    lines = ['| Model term | ' + label + ' | ' + adjusted + ' | Adjusted 95% CI |', '|---|---:|---:|---|']
     for term in terms:
         original = unadjusted.get(term.get('term'))
         original_or = '{:.3f}'.format(original['odds_ratio']) if original else '—'
@@ -239,6 +275,8 @@ def _funnel(survey):
 
 def _missing_notes(survey, spec):
     names = {'outcome': 'Outcome', 'education': 'Education', 'race': 'Race/ethnicity', 'sex': 'Sex', 'age': 'Age'}
+    if spec.get('outcome', 'fair_poor') != 'fair_poor':
+        names['outcome'] = outcome_label(spec['outcome']) + ' (' + outcome_metadata(spec)['variable'] + ')'
     relevant = ['outcome']
     if spec.get('analysis') == 'regression':
         relevant.extend(['education', 'race', 'sex', 'age'])
@@ -258,15 +296,22 @@ def _missing_notes(survey, spec):
     text = '; '.join(parts)
     if len(parts) > 1:
         text += '. Missingness can overlap across variables; these counts must not be added together'
-    raw = ((survey.get('missingness_by_code') or {}).get('filtered_domain') or {}).get('PHSTAT_A') or {}
+    variable = outcome_metadata(spec)['variable']
+    raw = ((survey.get('missingness_by_code') or {}).get('filtered_domain') or {}).get(variable) or {}
     code_parts = []
     for key, label in [('refused', 'Refused'), ('not_ascertained', 'Not ascertained'), ('dont_know', 'Don’t know')]:
         count = _count((raw.get(key) or {}).get('n_range'))
         maximum = ((raw.get(key) or {}).get('n_range') or {}).get('max')
         if count and finite(maximum) and maximum > 0:
             code_parts.append(label + ' ' + count + ' people')
+    if spec.get('outcome', 'fair_poor') != 'fair_poor':
+        for key, label in [('blank_n_range', 'Blank'), ('other_registered_missing_n_range', 'Other registered missing'), ('other_invalid_n_range', 'Other invalid')]:
+            value = raw.get(key)
+            count = _count(value)
+            if count and isinstance(value, dict) and finite(value.get('max')) and value['max'] > 0:
+                code_parts.append(label + ' ' + count + ' people')
     if code_parts:
-        text += ('; ' if text else '') + 'Among invalid outcome responses: ' + ', '.join(code_parts)
+        text += ('; ' if text else '') + ('Among invalid outcome responses: ' if spec.get('outcome', 'fair_poor') == 'fair_poor' else 'Among invalid ' + variable + ' responses: ') + ', '.join(code_parts)
     return text + '. ' if text else ''
 
 
@@ -298,7 +343,7 @@ def _method_summary(survey, spec, regression):
     full_design = ('The full adult survey design was retained before taking the analysis domain. '
                    if design.get('constructed_before_domain_subset') is True else
                    'The registered method retains the full adult design before domain analysis; its execution flag is absent here. ')
-    outcome = 'Fair/poor is PHSTAT_A=4/5; invalid responses are excluded.'
+    outcome = 'Fair/poor is PHSTAT_A=4/5; invalid responses are excluded.' if spec.get('outcome', 'fair_poor') == 'fair_poor' else outcome_coding(spec)
     bullets = [full_design + outcome]
     if regression.get('status') == 'ok':
         model = 'Model: `' + _formula_name(regression['formula']) + '`. ' if regression.get('formula') else ''
@@ -344,7 +389,8 @@ def _method_steps(result, survey, spec, regression):
     else:
         steps.append('**Check the population definition first.** The registered procedure constructs the full adult design before subsetting the age and category domain. This record does not include a complete design-execution flag, so the table alone cannot confirm that step.')
     funnel = _funnel(survey)
-    steps.append('**Define the outcome and denominator.** PHSTAT_A=4 or 5 is coded as fair or poor; 1–3 are the other valid responses. Refused, not ascertained, and don’t-know responses are excluded from the relevant denominator, rather than counted as healthy. ' +
+    coding = 'PHSTAT_A=4 or 5 is coded as fair or poor; 1–3 are the other valid responses. Refused, not ascertained, and don’t-know responses are excluded from the relevant denominator, rather than counted as healthy. ' if spec.get('outcome', 'fair_poor') == 'fair_poor' else outcome_coding(spec) + ' '
+    steps.append('**Define the outcome and denominator.** ' + coding +
                  ('Recorded counts are: ' + funnel + '. ' if funnel else 'A complete sample-flow record was not supplied, so intermediate counts are not filled in.'))
     if regression.get('status') == 'ok':
         formula = regression.get('formula')
@@ -365,7 +411,8 @@ def _method_steps(result, survey, spec, regression):
             description += 'Relative to the category-filtered domain' + (' (n=' + baseline + ')' if baseline else '') + ', complete-case processing excludes ' + excluded + ' people, including those with missing outcomes. '
         steps.append('**Compare groups in the registered model.** ' + description)
     else:
-        steps.append('**Calculate each group’s weighted proportion.** Use `Σ(w×y) / Σw`: w is the survey weight; y is 1 for fair or poor and 0 for the other valid responses. Sum the weights for outcome=1 and divide by the total weight of valid responses in that group. This is a weighted proportion, not a simple headcount fraction.')
+        indicator = 'fair or poor' if spec.get('outcome', 'fair_poor') == 'fair_poor' else outcome_label(spec['outcome']).lower()
+        steps.append('**Calculate each group’s weighted proportion.** Use `Σ(w×y) / Σw`: w is the survey weight; y is 1 for ' + indicator + ' and 0 for the other valid responses. Sum the weights for outcome=1 and divide by the total weight of valid responses in that group. This is a weighted proportion, not a simple headcount fraction.')
     imputation, m = _mi_info(survey, regression)
     if m and m > 1:
         description = ('Estimate each of all 10 official income imputations separately, then combine them' if m == 10 else 'The record reports combining {} imputations'.format(m))
@@ -481,6 +528,11 @@ def build_analysis_answer(result, spec, previous=None, question=None):
     if (result.get('status') != 'ok' or survey.get('status') not in (None, 'ok') or
             regression.get('status') not in (None, 'ok')):
         return _blocked_answer(result, survey, spec)
+    if not outcome_matches(survey, spec):
+        return ('**Conclusion: no usable statistical estimate was released.**\n\nThe recorded outcome descriptor does not match '
+                'the registered event and source variable. Existing results cannot be relabeled as another outcome; rerun the intended specification.')
+    event = outcome_label(spec.get('outcome', 'fair_poor'))
+    custom_event = event if spec.get('outcome', 'fair_poor') != 'fair_poor' else None
     rows = survey.get('rows') or []
     released = [row for row in rows if _released(row)]
     contrasts = _valid_contrasts(survey)
@@ -492,13 +544,16 @@ def build_analysis_answer(result, spec, previous=None, question=None):
             reference_text = category_name(reference) if reference else 'the registered reference group'
             conclusion = 'For {} versus {}, the adjusted OR is {:.3f} (95% CI {:.3f}–{:.3f}), describing association conditional on the registered covariates.'.format(
                 _term_name(term['term']), reference_text, term['odds_ratio'], term['ci_low'], term['ci_high'])
+            if custom_event:
+                conclusion += ' The modeled event is ' + event.lower() + '.'
         else:
             conclusion = 'The regression returned, but the record does not provide complete, quotable non-intercept ORs and intervals. Missing coefficients are not invented.'
     elif contrasts:
         conclusion = _contrast_statement(contrasts[0])
     elif len(released) == 1:
         row = released[0]
-        conclusion = 'For {}, the weighted proportion reporting fair or poor health is {} (95% CI {}).'.format(_row_name(row), _pct(row['estimate']), _interval(row))
+        conclusion = ('For {}, the weighted proportion for {} is {} (95% CI {}).'.format(_row_name(row), event.lower(), _pct(row['estimate']), _interval(row)) if custom_event else
+                      'For {}, the weighted proportion reporting fair or poor health is {} (95% CI {}).'.format(_row_name(row), _pct(row['estimate']), _interval(row)))
     elif released:
         lookup = {row.get('group_id'): row for row in released}
         endpoints = {'education': ('less_than_high_school', 'bachelors_plus'), 'income': ('below_100', '400_plus')}.get(spec.get('group_by'))
@@ -509,6 +564,9 @@ def build_analysis_answer(result, spec, previous=None, question=None):
         if endpoints and all(key in lookup for key in endpoints):
             conclusion = 'In this analysis population, the “{}” group has a fair-or-poor proportion of {}, compared with {} for the “{}” group. The first-minus-second point-estimate difference is {} percentage points.'.format(
                 _row_name(first), _pct(first['estimate']), _pct(last['estimate']), _row_name(last), _pp(first['estimate'] - last['estimate']))
+            if custom_event:
+                conclusion = 'For {}, the “{}” group has a weighted proportion of {}, compared with {} for the “{}” group. The first-minus-second point-estimate difference is {} percentage points.'.format(
+                    event.lower(), _row_name(first), _pct(first['estimate']), _pct(last['estimate']), _row_name(last), _pp(first['estimate'] - last['estimate']))
         else:
             conclusion = 'Among released estimates, {} has the highest point estimate ({}) and {} the lowest ({}), a difference of {} percentage points.'.format(
                 _row_name(first), _pct(first['estimate']), _row_name(last), _pct(last['estimate']), _pp(first['estimate'] - last['estimate']))
@@ -520,7 +578,7 @@ def build_analysis_answer(result, spec, previous=None, question=None):
                         'This reuses a validated cached survey result; **R was not rerun**.')
     if regression.get('status') == 'ok':
         if terms:
-            sections.append(_regression_table(survey, regression, terms))
+            sections.append(_regression_table(survey, regression, terms, custom_event))
         formula = str(regression.get('formula') or '')
         references = regression.get('references') or {}
         reference_text = ', '.join(VARIABLES[key] + '=' + category_name(value) for key, value in references.items()
@@ -532,10 +590,11 @@ def build_analysis_answer(result, spec, previous=None, question=None):
             detail += 'This is the reduced model without income, rather than the full income-adjusted model.'
         sections.append(detail)
     elif rows:
-        sections.append(_rate_table(rows, spec.get('group_by') == 'education_race'))
+        sections.append(_rate_table(rows, spec.get('group_by') == 'education_race', custom_event))
     if contrasts:
         chosen = contrasts[:4]
-        lines = ['| Registered contrast | Difference (percentage points) | 95% difference interval (percentage points) |', '|---|---:|---|']
+        difference_label = 'Difference (percentage points)' if not custom_event else 'Difference in ' + _safe(event.lower()) + ' (percentage points)'
+        lines = ['| Registered contrast | ' + difference_label + ' | 95% difference interval (percentage points) |', '|---|---:|---|']
         for contrast in chosen:
             lines.append('| {} | {} | {} to {} |'.format(_contrast_name(contrast), _pp(contrast['estimate']), _pp(contrast['ci_low']), _pp(contrast['ci_high'])))
         prefix = 'Only the first {} registered contrasts are shown here; the remainder are in the statistical details.\n\n'.format(len(chosen)) if len(contrasts) > len(chosen) else ''
@@ -544,13 +603,13 @@ def build_analysis_answer(result, spec, previous=None, question=None):
                     '**Method in brief**\n\n' + _method_summary(survey, spec, regression))
     interpretation = []
     if regression.get('status') == 'ok':
-        interpretation.append('An OR compares odds, not the probability of poor health or a risk ratio. A multiplicative change in odds is not the same multiplicative change in probability. Changes between unadjusted and adjusted ORs do not establish an effect caused by a particular covariate.')
+        interpretation.append('An OR compares odds, not the probability of ' + (event.lower() if custom_event else 'poor health') + ' or a risk ratio. A multiplicative change in odds is not the same multiplicative change in probability. Changes between unadjusted and adjusted ORs do not establish an effect caused by a particular covariate.')
         if terms:
             first = terms[0]
             interpretation.append('This interval includes the no-association reference value of 1, so no association for this term under the registered adjusted model remains compatible with the data.' if first['ci_low'] <= 1 <= first['ci_high'] else
                                   'This interval excludes 1, supporting a conditional association under this registered model. Residual confounding and model specification remain limitations.')
     else:
-        interpretation.append('A proportion is the weighted share of a group reporting fair or poor health. Subtracting proportions gives percentage points, not a relative percentage increase. The n in the table counts actual valid respondents, not an estimated national population.')
+        interpretation.append(('A proportion is the weighted share of a group meeting the registered event definition for ' + event.lower() + '. ' if custom_event else 'A proportion is the weighted share of a group reporting fair or poor health. ') + 'Subtracting proportions gives percentage points, not a relative percentage increase. The n in the table counts actual valid respondents, not an estimated national population.')
         if contrasts:
             if any(row['ci_low'] <= 0 <= row['ci_high'] for row in contrasts):
                 interpretation.append('At least one registered difference interval includes 0, so that difference remains uncertain. Uncertainty does not establish that the groups are identical.')
@@ -563,7 +622,7 @@ def build_analysis_answer(result, spec, previous=None, question=None):
         sections.append('### How to interpret these results\n\n' + '\n\n'.join(interpretation))
     else:
         if regression.get('status') == 'ok':
-            concise = ['OR compares odds, not the probability of poor health or a risk ratio.']
+            concise = ['OR compares odds, not the probability of ' + (event.lower() if custom_event else 'poor health') + ' or a risk ratio.']
             if terms:
                 first = terms[0]
                 concise.append('The interval includes the no-association reference value of 1; no association for this term under the registered adjusted model remains compatible with the data.' if first['ci_low'] <= 1 <= first['ci_high'] else
@@ -589,4 +648,6 @@ def build_analysis_answer(result, spec, previous=None, question=None):
         notes.append(model)
     if notes:
         sections.append(('### Denominators and completeness\n\n' if detailed else '') + '\n\n'.join(notes))
+    if outcome_caution(spec):
+        sections.append(outcome_caution(spec))
     return _RUN_ID.sub('the associated record', '\n\n'.join(sections))

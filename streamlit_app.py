@@ -11,6 +11,7 @@ from pathlib import Path
 import streamlit as st
 from nhis_agent.engine import Agent, csv_report, markdown_report
 from nhis_agent.conversation import ConversationService
+from nhis_agent.outcomes import get_outcome, allowed_outcomes
 from server import load_environment
 
 load_environment()
@@ -147,7 +148,7 @@ def _generation_label(record):
     return 'Model response' if isinstance(record, dict) and record.get('status') == 'ok' else 'Local explanation'
 
 
-def _plot(rows, comparisons):
+def _plot(rows, comparisons, outcome='fair_poor'):
     """Dot = survey estimate, capsule = its 95% CI, diamond = model mean."""
     rows = [r for r in rows if r.get('status') == 'ok' and finite(r.get('estimate'))]
     if not rows:
@@ -163,7 +164,8 @@ def _plot(rows, comparisons):
     key = ['<span><i class="nh-key-range"></i><i class="nh-key-dot"></i>Survey estimates and 95% confidence intervals</span>']
     if models:
         key.append('<span><i class="nh-key-model"></i>Model mean</span>')
-    parts = ['<div class="nh-card nh-chart"><div class="nh-chart-head"><div><h3>Fair or poor self-rated health</h3><p>Each row is a group; the band represents uncertainty in its survey estimate.</p></div>'
+    definition = get_outcome(outcome)
+    parts = ['<div class="nh-card nh-chart"><div class="nh-chart-head"><div><h3>' + esc(definition['label']) + '</h3><p>Each row is a group; the band represents uncertainty in its survey estimate.</p></div>'
              '<div class="nh-chart-key">' + ''.join(key) + '</div></div><div class="nh-plot" role="img" aria-label="Survey estimates and independent model judgments">']
     for row in rows:
         label = _row_label(row)
@@ -209,13 +211,14 @@ def show_result(result, question=None, *, show_answer=True, key_prefix="", show_
                                file_name=run_id + '.json', mime='application/json', key=key_prefix + 'blocked_' + run_id)
         return
     survey = result['survey']
+    outcome = get_outcome((result.get('spec') or {}).get('outcome', 'fair_poor'))
     rows = survey.get('rows', [])
     valid = [r for r in rows if r.get('status') == 'ok']
     regression = survey.get('regression', {})
     tabs = st.tabs(['Overview', 'Statistics', 'Model comparison', 'Methods and records'])
     with tabs[0]:
         if valid:
-            _plot(valid, result.get('comparison', []))
+            _plot(valid, result.get('comparison', []), outcome['id'])
         if regression.get('status') == 'ok':
             _coefficient_table(regression)
         notes = [line for line in str(result.get('answer', '')).splitlines() if line.strip()]
@@ -262,8 +265,10 @@ def show_result(result, question=None, *, show_answer=True, key_prefix="", show_
         with st.expander('Independent benchmark summary'):
             st.json(measurement)
     with tabs[3]:
-        _html('<div class="nh-card nh-note"><h3>Registered research scope</h3><p>NHIS 2024 · U.S. adults aged 25–64 · PHSTAT_A = 4 or 5 · Construct the full design before domain subsetting.</p>'
-              '<p class="nh-muted">R/Stata numerical agreement and external NCHS comparisons await independent verification.</p></div>')
+        _html('<div class="nh-card nh-note"><h3>Registered research scope</h3><p>NHIS 2024 · U.S. adults aged 25–64 · ' + esc(outcome['label']) + ' · Construct the full design before domain subsetting.</p>'
+              '<p>' + esc(outcome['definition']) + ' Time window: ' + esc(outcome['time_window']) + '.</p>'
+              '<p>Event coding: ' + esc(outcome['variable']) + ' = ' + esc(', '.join(str(code) for code in outcome['one'])) + '. Other valid response codes: ' + esc(', '.join(str(code) for code in outcome['zero'])) + '. Refused, not-ascertained, unknown and blank responses are excluded from the relevant denominator.</p>'
+              '<p class="nh-muted">' + esc(outcome['limitation']) + ' R/Stata numerical agreement and external NCHS comparisons await independent verification.</p></div>')
         with st.expander('Analysis specification and data provenance'):
             st.json({'spec': result.get('spec'), 'data': result.get('data'), 'provenance': survey.get('provenance')})
         with st.expander('Denominators, missing data, and release checks'):
@@ -714,7 +719,8 @@ elif page == 'Data and methods':
     _html('<div class="nh-block-head"><h2>A traceable research workflow</h2></div><div class="nh-methods">'
           + ''.join(f'<div class="nh-card"><b>{number}</b><strong>{title}</strong><p>{text}</p></div>' for number, title, text in descriptions) + '</div>')
     _html('<div class="nh-block-head"><h2>Research scope and release rules</h2></div><div class="nh-card nh-note">'
-          '<p>The population is U.S. adults aged 25–64, with fair or poor self-rated health as the outcome. Report unweighted n, weighted proportions, standard errors, and 95% confidence intervals. Suppress cells with n below 100 or other failed reliability checks.</p>'
+          '<p>The population is U.S. adults aged 25–64. Registered outcomes include ' + esc('; '.join(get_outcome(name)['label'] for name in allowed_outcomes())) + '. Insurance coverage describes the interview date; cost-related care barriers refer to the past 12 months.</p>'
+          '<p>Each outcome uses its own registered event codes, valid-response denominator and missing-data audit. Report unweighted n, weighted proportions, standard errors, and 95% confidence intervals. Suppress cells with n below 100 or other failed reliability checks.</p>'
           '<p class="nh-muted">Cross-sectional associations are not causal effects. Real-data calculation is available; R/Stata agreement and external NCHS comparisons await independent verification.</p></div>')
     if st.button('Download or verify official data', width='content'):
         agent.setup_data()

@@ -67,6 +67,8 @@ Assistant: Changes the presentation using the same saved estimates.
 
 Other supported requests include education × race/ethnicity comparisons, education or income gradients, and the registered logistic regression. “Low income” requires an explicit poverty cutoff; the application does not choose one silently.
 
+Medical-service distributions are also supported. Ask “How are health insurance coverage and timely access to care distributed?” or “有无医疗保险、是否能及时就医等医疗服务指标如何分布？”. The service calculates coverage and lack of coverage at interview (`NOTCOV_A`), delayed medical care due to cost in the past 12 months (`MEDDL12M_A`), and needed care not obtained due to cost in the past 12 months (`MEDNG12M_A`). Follow-ups such as “What about women?” and “Switch to income” retain all active indicators and their population filters. Each item keeps its own valid-response denominator, confidence interval, chart, and source record. Absence of a reported cost barrier does not establish timely care for every need. Definitions and coding are in the [official 2024 codebook](https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Dataset_Documentation/NHIS/2024/Adult-codebook.pdf), printed pages 187, 332, and 333, and in `config/registry.json`.
+
 Research replies lead with a conclusion and compact table, followed by brief methods and relevant qualifications. Ask “step by step,” “how was this calculated?” or “more detail” for the full calculation, denominators, and interval method. Income analyses retain multiple-imputation qualifications; regression distinguishes odds ratios from risks and causal effects.
 
 The web chat draws plots directly from released statistical records. Proportion charts include the recorded 95% confidence intervals; gradient charts use percentage points and a zero reference; adjusted odds-ratio forest plots use a logarithmic axis and a reference of one. Each panel has a source-record link and PNG/SVG downloads. Suppressed or invalid estimates never become plotted marks. Asking to plot existing results does not rerun R or blind measurement, and only results referenced by the current conversation are included. Large conversations show the most recent twelve matching results with an explicit notice about older records.
@@ -109,7 +111,7 @@ The conversation model can see published aggregate evidence and recent messages.
 ## Fixed statistical rules
 
 - Data: official NHIS 2024 Sample Adult public file. Population: US civilian noninstitutionalized adults aged 25–64.
-- Outcome: PHSTAT_A codes 4/5 are fair/poor; codes 1–3 are the other valid responses. Refused, unknown, unascertained, and missing responses are not treated as healthy.
+- Outcomes: fair/poor self-rated health (`PHSTAT_A` codes 4/5 vs 1–3); insurance coverage and its complement (`NOTCOV_A` codes 2 vs 1 and 1 vs 2); cost-related delayed care (`MEDDL12M_A` 1 vs 2); and cost-related unmet care (`MEDNG12M_A` 1 vs 2). Refused, unknown, unascertained, and missing responses are excluded from each outcome's denominator rather than treated as a negative response.
 - Design: construct the full adult design using WTFA_A, PSTRAT, and PPSU before taking age and categorical domains.
 - Education: less than high school; high school/GED; some college/associate degree; bachelor’s degree or higher.
 - Race/ethnicity: Hispanic of any race; non-Hispanic single-race White, Black, Asian; non-Hispanic other/multiple race.
@@ -157,7 +159,7 @@ Hosted startup uses `NHIS_HOST`, `NHIS_STATE_DIR`, `NHIS_ALLOWED_HOSTS`, `NHIS_A
 
 ## Verification
 
-Official data and the local R environment are installed. Seven real-data analyses have been executed: education and income proportions/gradients, education × race/ethnicity, full regression, and the reduced model. R reported no warnings in those runs.
+Official data and the local R environment are installed. Real-data checks cover the original education/income proportions and gradients, education × race/ethnicity, full/reduced regression, and the four new medical-service overall estimates. A new uninsured income gradient pooled all ten imputations; the uninsured adjusted and unadjusted regressions used the same complete-case sample. An independent weighted-sum and valid-count check matched the new R point estimates, coverage and noncoverage sum to one, and the original education estimates/SEs/CIs remained exactly unchanged. R reported no warnings in these runs. These checks do not establish independent variance validation.
 
 Independent R/Stata numerical agreement, NCHS external benchmarking, and successful live model-service validation remain pending. Ordinary-conversation and English-interface checks use isolated transport fixtures; they do not certify the external service.
 

@@ -84,6 +84,13 @@ async function test(name, fn) { await fn(); checked++; console.log(`PASS ${name}
     assert.equal(marked(f.article, 'bar')[0].attributes.x, '238'); assert(find(f.article, 'line').some((line) => line.attributes['data-reference'] === '0'));
   });
 
+  await test('Care-access chart labels and axes do not revert to self-rated health', async () => {
+    const f = fixture(); f.context.appendCharts(f.article, [panel({title: 'Insured at interview', subtitle: 'Adults aged 25–64; coverage at interview does not establish timely care.', x_label: 'Insured at interview (%)', outcome_id: 'insured', outcome: {id: 'insured', label: 'Insured at interview'}})]);
+    assert(f.article.textContent.includes('Insured at interview (%)'));
+    assert(!f.article.textContent.includes('Fair or poor'));
+    assert.equal(find(f.article, 'g')[0].attributes['data-value'], '12.3');
+  });
+
   await test('Gradient pp and odds-ratio forest keep native units and scientific references', async () => {
     const f = fixture(); f.context.appendCharts(f.article, [panel({kind: 'gradient', unit: 'percentage_points', groups: [{label: 'A minus reference', value: -3.4, low: -5.6, high: -1.2}]}),
       panel({kind: 'regression', unit: 'odds_ratio', style: 'bar', reference: 1, groups: [{label: 'Education term', value: 2, low: 1.1, high: 3.2}]})]);

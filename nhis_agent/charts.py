@@ -7,7 +7,8 @@ combined into a synthetic population or comparison interval.
 import math
 import re
 
-from .answers import category_name, scope_name, VARIABLES
+from .answers import category_name, scope_name, VARIABLES, outcome_matches
+from .outcomes import outcome_label, allowed_outcomes, get_outcome
 
 _RUN_ID = re.compile(r'[0-9]{8}T[0-9]{6}Z-[a-f0-9]{10}')
 _SECRET = re.compile(r'\bsk-[A-Za-z0-9_-]{8,}')
@@ -129,8 +130,10 @@ def make_charts(results,kind='auto',style='point'):
                 or not isinstance(result.get('spec'),dict)):
             continue
         spec=result['spec']
-        if (spec.get('year',2024)!=2024 or spec.get('outcome','fair_poor')!='fair_poor'
+        if (spec.get('year',2024)!=2024 or spec.get('outcome','fair_poor') not in allowed_outcomes()
                 or spec.get('age_min',25)!=25 or spec.get('age_max',64)!=64 or spec.get('confidence',.95)!=.95):
+            continue
+        if not outcome_matches(result['survey'], spec):
             continue
         selected=kind if kind!='auto' else spec.get('analysis','proportion')
         if selected not in ('proportion','gradient','regression'):
@@ -142,9 +145,10 @@ def make_charts(results,kind='auto',style='point'):
         if not groups:
             continue
         unit={'proportion':'percent','gradient':'percentage_points','regression':'odds_ratio'}[selected]
-        titles={'proportion':'Fair or poor self-rated health',
-                'gradient':'Group differences in fair or poor self-rated health',
-                'regression':'Adjusted odds ratios for fair or poor self-rated health'}
+        event=outcome_label(spec.get('outcome','fair_poor'))
+        titles={'proportion':event,
+                'gradient':'Group differences in '+event.lower(),
+                'regression':'Adjusted odds ratios for '+event.lower()}
         title=titles[selected]
         if selected=='proportion' and spec.get('group_by') not in (None,'overall'):
             title+=' by '+VARIABLES.get(spec['group_by'],_text(spec['group_by'])).lower()
@@ -152,13 +156,17 @@ def make_charts(results,kind='auto',style='point'):
         imputation=result['survey'].get('imputation')
         if isinstance(imputation,dict) and imputation.get('required') is True and imputation.get('m')==10:
             subtitle+=' Income estimates pool all 10 official imputations; n is the minimum across imputations.'
-        labels={'proportion':'Fair or poor self-rated health (%)',
+        if spec.get('outcome','fair_poor')!='fair_poor':
+            subtitle+=' '+get_outcome(spec['outcome']).get('limitation','')
+        labels={'proportion':event+' (%)',
                 'gradient':'Difference (percentage points)',
                 'regression':'Adjusted odds ratio (log scale)'}
         charts.append({'id':chart_id,'title':title,'subtitle':subtitle,'kind':selected,
                        'style':'forest' if selected=='regression' else style,
                        'x_label':labels[selected],'reference':1 if selected=='regression' else 0,
-                       'groups':groups,'source_run_id':result['run_id'],'unit':unit})
+                       'groups':groups,'source_run_id':result['run_id'],'unit':unit,
+                       'outcome_id':spec.get('outcome','fair_poor'),
+                       'outcome':get_outcome(spec.get('outcome','fair_poor'))})
         seen.add(chart_id)
     return charts
 

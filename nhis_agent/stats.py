@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 from datetime import datetime, timezone
+from .outcomes import get_outcome, allowed_outcomes
 
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_PATH = ROOT / "config" / "registry.json"
@@ -75,8 +76,9 @@ def _normalise_spec(spec):
     year = spec.get("year", 2024)
     if isinstance(year, bool) or str(year) != "2024":
         raise ValueError("Only the verified 2024 NHIS Sample Adult release is supported.")
-    if spec.get("outcome", "fair_poor") != "fair_poor":
-        raise ValueError("Only fair/poor self-rated health (PHSTAT_A = 4 or 5) is implemented.")
+    outcome = spec.get("outcome", "fair_poor")
+    if not isinstance(outcome,str) or outcome not in allowed_outcomes():
+        raise ValueError("Choose a verified self-rated-health, insurance, or cost-related medical-care outcome.")
     if spec.get("age_min", 25) != 25 or spec.get("age_max", 64) != 64:
         raise ValueError("The registered age domain is fixed at 25–64 years.")
     if spec.get("confidence", 0.95) != 0.95:
@@ -116,7 +118,7 @@ def _normalise_spec(spec):
     minimum = spec.get("min_n", 100)
     if isinstance(minimum, bool) or not isinstance(minimum, int) or not 100 <= minimum <= 100000:
         raise ValueError("min_n must be an integer from 100 to 100000; the safety floor is 100.")
-    answer = {"year": 2024, "outcome": "fair_poor", "analysis": analysis, "group_by": group_by,
+    answer = {"year": 2024, "outcome": outcome, "analysis": analysis, "group_by": group_by,
               "filters": clean_filters, "min_n": minimum, "adjustment": adjustment}
     if "income_csv_path" in spec:
         if not isinstance(spec["income_csv_path"], str):
@@ -125,7 +127,7 @@ def _normalise_spec(spec):
     return answer
 
 
-def _preflight(csv_path):
+def _preflight(csv_path, outcome="fair_poor"):
     """Check the full official release, not a user-filtered extract, before R sees it."""
     source = Path(csv_path).expanduser().resolve()
     if not source.is_file():
@@ -135,6 +137,9 @@ def _preflight(csv_path):
     expected_n = registry["datasets"]["adult_2024"]["expected_rows"]
     count, strata, households = 0, {}, set()
     numeric_fields = [field for field in REQUIRED if field != "HHX"]
+    definition = get_outcome(outcome)
+    target = definition['variable']
+    target_codes = set(definition['one'] + definition['zero'] + definition['missing'])
     valid_codes = {"PHSTAT_A": set(range(1, 6)) | {7, 8, 9},
                    "EDUCP_A": set(range(0, 11)) | {97, 98, 99},
                    "HISPALLP_A": set(range(1, 8)) | {97, 98, 99},
@@ -145,7 +150,7 @@ def _preflight(csv_path):
         names = reader.fieldnames or []
         if len(names) != len(set(names)):
             raise ValueError("The CSV contains duplicate column names.")
-        missing = sorted(set(REQUIRED) - set(names))
+        missing = sorted((set(REQUIRED) | {target}) - set(names))
         if missing:
             raise ValueError("Missing official variables: " + ", ".join(missing))
         for row in reader:
@@ -165,6 +170,14 @@ def _preflight(csv_path):
             for name, codes in valid_codes.items():
                 if vals[name] not in codes:
                     raise ValueError("Unrecognized " + name + " code at data row " + str(count))
+            raw = row.get(target)
+            if raw not in ('', None, 'NA'):
+                try:
+                    value = float(raw)
+                except (ValueError,TypeError):
+                    raise ValueError('Invalid registered outcome code at data row ' + str(count)) from None
+                if not math.isfinite(value) or value not in target_codes:
+                    raise ValueError('Unrecognized ' + target + ' code at data row ' + str(count))
             key = row["HHX"]
             if not key or key in households:
                 raise ValueError("Missing or duplicate Sample Adult household identifier.")
@@ -184,6 +197,7 @@ def _preflight(csv_path):
             "design_df": sum(len(v) - 1 for v in strata.values()),
             "source_url": registry["datasets"]["adult_2024"]["url"],
             "documentation_url": registry["documentation_url"],
+            "outcome": dict(definition,id=outcome),
             "source_authentication": "Local SHA-256 and official release structure checks; not a CDC-published checksum."}
 
 
@@ -248,7 +262,7 @@ def analyze(csv_path: str, spec: dict, run_dir: str) -> dict:
         request_path = destination / "analysis_spec.json"
         request_path.write_text(json.dumps(clean_spec, indent=2) + "\n", encoding="utf-8")
         try:
-            provenance = _preflight(csv_path)
+            provenance = _preflight(csv_path, clean_spec['outcome'])
             provenance["analysis_sources_sha256"] = {
                 name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                 for name in ("config/registry.json", "scripts/analyze.R", "nhis_agent/stats.py")}

@@ -16,6 +16,7 @@ from .spec import route, fingerprint, GROUPS
 from .process import ProcessTrace, describe_spec
 from .cache import SurveyCache
 from . import chat_api, grounding, dialogue
+from .outcomes import get_outcome, allowed_outcomes
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -122,9 +123,10 @@ def csv_report(result):
 
 
 def markdown_report(result):
-    lines = ['# NHIS 2024 health stratification analysis record', '', 'Run: ' + result['run_id'], '', result['answer'], '',
+    outcome = get_outcome(result.get('spec',{}).get('outcome','fair_poor'))
+    lines = ['# NHIS 2024 analysis: ' + outcome['label'], '', 'Run: ' + result['run_id'], '', result['answer'], '',
              '## Registered specification', '', '```json', json.dumps(result['spec'], ensure_ascii=False, indent=2), '```', '',
-             '## Survey estimates', '', '| Group | Unweighted n | Fair or poor (%) | 95% CI (%) | Status |', '|---|---:|---:|---|---|']
+             '## Survey estimates', '', '| Group | Unweighted n | '+outcome['label']+' (%) | 95% CI (%) | Status |', '|---|---:|---:|---|---|']
     for row in result['survey'].get('rows', []):
         if row.get('status') == 'ok':
             lines.append('| {} | {} | {:.2f} | {:.2f}–{:.2f} | Passed |'.format(row['label'], row['n'], 100*row['estimate'], 100*row['ci_low'], 100*row['ci_high']))
@@ -151,9 +153,11 @@ def markdown_report(result):
         for contrast in result['gradient_comparison']:
             lines.append('| {} | {:+.2f} | {:+.2f} | {:+.2f} |'.format(contrast['label'], contrast['survey_gradient_pp'], contrast['model_gradient_pp'], contrast['gradient_gap_pp']))
     lines += ['', '## Methods and verification status', '', 'Construct the complex survey design on the full adult sample before restricting to the population aged 25–64, using WTFA_A weights, PSTRAT strata, and PPSU sampling units.',
-              'The outcome is PHSTAT_A=4 or 5. Invalid responses, refusals, and other missing responses are not classified as healthy. See result.json for denominators and missing-data handling.',
+              'Outcome: ' + outcome['label'] + '. ' + outcome.get('definition','') + ' Positive codes: ' + str(outcome['one']) + '; negative codes: ' + str(outcome['zero']) + ' in ' + outcome['variable'] + '. Invalid responses, refusals, and other missing responses are excluded from the denominator, not treated as a negative response. See result.json for denominators and missing-data handling.',
               'Independent R/Stata agreement checks and external NCHS comparisons remain pending. These research results await independent verification.',
-              'These cross-sectional associations do not establish causation. Fair or poor self-rated health is not a clinical diagnosis, and agreement with survey estimates does not make a model a substitute for the survey.']
+              'These cross-sectional associations do not establish causation. These survey measures are not clinical diagnoses, and agreement with survey estimates does not make a model a substitute for the survey.']
+    if outcome.get('limitation'):
+        lines += ['', outcome['limitation']]
     if result.get('comparison'):
         lines += ['', '## Model–survey gaps', '', '| Group | Model mean (%) | Model − survey (percentage points) | Within survey CI | Valid/planned calls |', '|---|---:|---:|---|---|']
         for row in result['comparison']:
@@ -201,6 +205,7 @@ class Agent:
                 'models': models.public_status(config),
                 'dialogue': self.dialogue_status(),
                 'capabilities': [{'id': key, 'label': value} for key, value in GROUPS.items()],
+                'outcomes':[{'id':key,'label':get_outcome(key)['label']} for key in allowed_outcomes()],
                 'registry': registry,
                 'validation': {'r_stata': 'pending', 'nchs_external': 'pending', 'real_data_only': True},
                 'project': str(self.root)}
@@ -244,6 +249,8 @@ class Agent:
                               'status': result['status'], 'group_by': spec.get('group_by'),
                               'analysis': spec.get('analysis'), 'model': model if isinstance(model, str) else None,
                               'created_at': created_at})
+                if 'outcome' in spec:
+                    items[-1]['outcome'] = spec['outcome']
             except (OSError, ValueError, TypeError, UnicodeError):
                 continue
             if len(items) >= limit:
@@ -381,6 +388,7 @@ class Agent:
         return self._execute_spec(validated, question, measure_model, repeats, prompt_versions, trace)
 
     def _execute_spec(self, spec, question, measure_model, repeats, prompt_versions, trace):
+        outcome = get_outcome(spec.get('outcome','fair_poor'))
         if not isinstance(measure_model, bool):
             raise ValueError('measure_model must be Boolean.')
         if type(repeats) is not int or not 1 <= repeats <= 5 or type(prompt_versions) is not int or not 1 <= prompt_versions <= 3:
@@ -420,8 +428,9 @@ class Agent:
         except (ValueError, OSError):
             cache_identity, cached = None, None
         trace.emit('statistics', 'running', ('Read validated statistics matching the same data, specification, program, and R versions.' if cached else plan['method'] + '; construct the full design before restricting to the population aged 25–64.'),
-                   {'design_variables':['WTFA_A','PSTRAT','PPSU'], 'missing_policy':'Use only valid denominators for the relevant outcome and grouping; missing responses are not classified as healthy.',
-                    'estimation':'Registered complex-survey logistic models; adjusted and unadjusted models use the same complete cases.' if spec.get('analysis') == 'regression' else 'Group proportion = Σ(survey weight × fair/poor indicator) / Σsurvey weight; standard errors use Taylor linearization with strata and PSUs.',
+                   {'design_variables':['WTFA_A','PSTRAT','PPSU'], 'missing_policy':'Use only valid denominators for the selected outcome and grouping; missing responses are not treated as a negative response.',
+                    'outcome':outcome['label'],
+                    'estimation':'Registered complex-survey logistic models; adjusted and unadjusted models use the same complete cases.' if spec.get('analysis') == 'regression' else 'Group proportion = Σ(survey weight × registered outcome indicator) / Σsurvey weight; standard errors use Taylor linearization with strata and PSUs.',
                     'income_imputations':10 if spec.get('group_by') == 'income' or 'income' in spec.get('filters', {}) or spec.get('analysis') == 'regression' and spec.get('adjustment') == 'full' else None})
         if cached:
             survey = cached['survey']
@@ -439,6 +448,11 @@ class Agent:
             trace.emit('statistics', 'blocked', result['answer'])
             return self._finish(directory, result, trace)
         denominators = survey.get('denominators', {})
+        if spec.get('outcome','fair_poor') != 'fair_poor' and (not isinstance(survey.get('outcome'),dict) or
+                survey['outcome'].get('id') != spec['outcome'] or survey['outcome'].get('variable') != outcome['variable']):
+            result['survey'] = {'status':'blocked','rows':[]}
+            result['answer'] = 'The statistical output did not identify the requested medical-service measure, so no estimates were released.'
+            return self._finish(directory,result,trace)
         trace.emit('statistics', 'complete', 'Matching validated historical statistics were loaded; R was not rerun.' if cached else 'The R survey program returned estimates, standard errors, and confidence intervals. Each group denominator includes only valid outcome and grouping responses.',
                    {'denominators':survey.get('denominators', {}), 'design':survey.get('design', {}),
                     'imputation':survey.get('imputation', {}), 'cache_hit':bool(cached),
@@ -521,7 +535,8 @@ class Agent:
 
     def _explain(self, result):
         rows = [r for r in result['survey'].get('rows', []) if r.get('status') == 'ok']
-        lines = ['The registered NHIS 2024 analysis is complete. Denominators include adults aged 25–64 in the requested domain with valid outcome and relevant grouping variables.']
+        outcome = get_outcome(result.get('spec',{}).get('outcome','fair_poor'))
+        lines = ['The NHIS 2024 analysis of '+outcome['label'].lower()+' is complete. Denominators include adults aged 25–64 in the requested domain with valid responses for the selected outcome and relevant grouping variables.']
         for row in rows[:6]:
             lines.append('{}: {:.1f}% (95% CI {:.1f}–{:.1f}%), unweighted n={}.'.format(row['label'],row['estimate']*100,row['ci_low']*100,row['ci_high']*100,row['n']))
         regression = result['survey'].get('regression', {})
@@ -540,7 +555,7 @@ class Agent:
         suppressed = sum(r.get('status') == 'suppressed' for r in result['survey'].get('rows', []))
         if suppressed:
             lines.append('{} groups failed release checks and their numerical estimates were suppressed.'.format(suppressed))
-        lines.append('R/Stata agreement and external NCHS comparisons remain pending. These results describe cross-sectional associations; fair or poor self-rated health is not a clinical diagnosis.')
+        lines.append('R/Stata agreement and external NCHS comparisons remain pending. These results describe cross-sectional associations and are not clinical diagnoses.')
         return '\n'.join(lines)
 
     def _finish(self, directory, result, trace=None):

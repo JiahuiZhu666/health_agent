@@ -1,5 +1,5 @@
 {
-  "registry_version": "2024.1",
+  "registry_version": "2024.2",
   "documentation_url": "https://www.cdc.gov/nchs/nhis/documentation/2024-nhis.html",
   "verified_on": "2026-11-15",
   "datasets": {
@@ -61,7 +61,275 @@
         8,
         9
       ],
-      "codebook_page": 32
+      "codebook_page": 32,
+      "missing_reasons": {
+        "7": "Refused",
+        "8": "Not ascertained",
+        "9": "Don't know"
+      },
+      "universe": "Sample adults aged 18 years or older",
+      "universe_expression": "HHSTAT_A=1",
+      "time_window": "At the time of interview",
+      "codebook_url": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Dataset_Documentation/NHIS/2024/adult-codebook.pdf",
+      "codebook_version": "18 June 2025",
+      "denominator_note": "Use valid responses for this outcome within the requested population. Refused, not ascertained, unknown, blank and system-missing responses are excluded, not coded as absence of the event.",
+      "system_missing_policy": "Exclude blank or system-missing values; never recode them to zero.",
+      "event": "reporting fair or poor self-rated health",
+      "short_label": "Fair or poor self-rated health",
+      "definition": "For Sample Adults aged 18 years or older, this event is a report of fair or poor general health at the time of interview.",
+      "code_labels": {
+        "1": "Excellent",
+        "2": "Very good",
+        "3": "Good",
+        "4": "Fair",
+        "5": "Poor",
+        "7": "Refused",
+        "8": "Not ascertained",
+        "9": "Don't know"
+      },
+      "limitation": "Self-rated health is a subjective general-health measure, not a clinical diagnosis or a measure of health insurance or access to medical care."
+    },
+    "insured": {
+      "missing": [
+        7,
+        8,
+        9
+      ],
+      "missing_reasons": {
+        "7": "Refused",
+        "8": "Not ascertained",
+        "9": "Don't know"
+      },
+      "universe": "Sample adults aged 18 years or older",
+      "universe_expression": "HHSTAT_A=1",
+      "time_window": "At the time of interview",
+      "codebook_url": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Dataset_Documentation/NHIS/2024/adult-codebook.pdf",
+      "codebook_version": "18 June 2025",
+      "denominator_note": "Use valid responses for this outcome within the requested population. Refused, not ascertained, unknown, blank and system-missing responses are excluded, not coded as absence of the event.",
+      "system_missing_policy": "Exclude blank or system-missing values; never recode them to zero.",
+      "variable": "NOTCOV_A",
+      "label": "Insured at interview",
+      "short_label": "Insured at interview",
+      "one": [
+        2
+      ],
+      "zero": [
+        1
+      ],
+      "codebook_page": 187,
+      "recode": true,
+      "source_variables": [
+        "MEDICARE_A",
+        "MEDICAID_A",
+        "PRIVATE_A",
+        "CHIP_A",
+        "OTHPUB_A",
+        "OTHGOV_A",
+        "MILITARY_A"
+      ],
+      "event": "having health insurance coverage at the time of interview",
+      "definition": "For Sample Adults aged 18 years or older, this event is having health insurance coverage at the time of interview, using the edited NOTCOV_A classification.",
+      "code_labels": {
+        "1": "Not covered",
+        "2": "Covered",
+        "7": "Refused",
+        "8": "Not ascertained",
+        "9": "Don't know"
+      },
+      "related_items": {
+        "HICOV_A": {
+          "variable": "HICOV_A",
+          "label": "Initial report of health insurance coverage",
+          "definition": "The initial question records whether any health insurance or other health care plan is reported before the insurance-section editing process.",
+          "yes": [
+            1
+          ],
+          "no": [
+            2
+          ],
+          "missing": [
+            7,
+            8,
+            9
+          ],
+          "missing_reasons": {
+            "7": "Refused",
+            "8": "Not ascertained",
+            "9": "Don't know"
+          },
+          "universe": "Sample adults aged 18 years or older",
+          "universe_expression": "HHSTAT_A=1",
+          "time_window": "At the time of interview",
+          "codebook_url": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Dataset_Documentation/NHIS/2024/adult-codebook.pdf",
+          "codebook_page": 297,
+          "question_id": "INS.0010.00.1",
+          "limitation": "The codebook warns that this initial item does not incorporate insurance-section editing. It is not substituted for the edited NOTCOV_A coverage classification."
+        }
+      },
+      "limitation": "Coverage is measured at interview, not throughout the past year. Insurance coverage does not establish that needed care was obtained promptly.",
+      "source_note": "The edited coverage definition includes private insurance, Medicare, Medicaid, CHIP, state-sponsored or other government plans, and military coverage including TRICARE, VA and CHAMP-VA. The initial HICOV_A response is not used as a substitute."
+    },
+    "uninsured": {
+      "missing": [
+        7,
+        8,
+        9
+      ],
+      "missing_reasons": {
+        "7": "Refused",
+        "8": "Not ascertained",
+        "9": "Don't know"
+      },
+      "universe": "Sample adults aged 18 years or older",
+      "universe_expression": "HHSTAT_A=1",
+      "time_window": "At the time of interview",
+      "codebook_url": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Dataset_Documentation/NHIS/2024/adult-codebook.pdf",
+      "codebook_version": "18 June 2025",
+      "denominator_note": "Use valid responses for this outcome within the requested population. Refused, not ascertained, unknown, blank and system-missing responses are excluded, not coded as absence of the event.",
+      "system_missing_policy": "Exclude blank or system-missing values; never recode them to zero.",
+      "variable": "NOTCOV_A",
+      "label": "Uninsured at interview",
+      "short_label": "Uninsured at interview",
+      "one": [
+        1
+      ],
+      "zero": [
+        2
+      ],
+      "codebook_page": 187,
+      "recode": true,
+      "source_variables": [
+        "MEDICARE_A",
+        "MEDICAID_A",
+        "PRIVATE_A",
+        "CHIP_A",
+        "OTHPUB_A",
+        "OTHGOV_A",
+        "MILITARY_A"
+      ],
+      "event": "having no health insurance coverage at the time of interview",
+      "definition": "For Sample Adults aged 18 years or older, this event is having no health insurance coverage at the time of interview, using the edited NOTCOV_A classification.",
+      "code_labels": {
+        "1": "Not covered",
+        "2": "Covered",
+        "7": "Refused",
+        "8": "Not ascertained",
+        "9": "Don't know"
+      },
+      "related_items": {
+        "HICOV_A": {
+          "variable": "HICOV_A",
+          "label": "Initial report of health insurance coverage",
+          "definition": "The initial question records whether any health insurance or other health care plan is reported before the insurance-section editing process.",
+          "yes": [
+            1
+          ],
+          "no": [
+            2
+          ],
+          "missing": [
+            7,
+            8,
+            9
+          ],
+          "missing_reasons": {
+            "7": "Refused",
+            "8": "Not ascertained",
+            "9": "Don't know"
+          },
+          "universe": "Sample adults aged 18 years or older",
+          "universe_expression": "HHSTAT_A=1",
+          "time_window": "At the time of interview",
+          "codebook_url": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Dataset_Documentation/NHIS/2024/adult-codebook.pdf",
+          "codebook_page": 297,
+          "question_id": "INS.0010.00.1",
+          "limitation": "The codebook warns that this initial item does not incorporate insurance-section editing. It is not substituted for the edited NOTCOV_A coverage classification."
+        }
+      },
+      "limitation": "Coverage is measured at interview, not throughout the past year. Insurance coverage does not establish that needed care was obtained promptly.",
+      "source_note": "The edited coverage definition includes private insurance, Medicare, Medicaid, CHIP, state-sponsored or other government plans, and military coverage including TRICARE, VA and CHAMP-VA. The initial HICOV_A response is not used as a substitute."
+    },
+    "delayed_care_cost": {
+      "missing": [
+        7,
+        8,
+        9
+      ],
+      "missing_reasons": {
+        "7": "Refused",
+        "8": "Not ascertained",
+        "9": "Don't know"
+      },
+      "universe": "Sample adults aged 18 years or older",
+      "universe_expression": "HHSTAT_A=1",
+      "time_window": "Past 12 months",
+      "codebook_url": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Dataset_Documentation/NHIS/2024/adult-codebook.pdf",
+      "codebook_version": "18 June 2025",
+      "denominator_note": "Use valid responses for this outcome within the requested population. Refused, not ascertained, unknown, blank and system-missing responses are excluded, not coded as absence of the event.",
+      "system_missing_policy": "Exclude blank or system-missing values; never recode them to zero.",
+      "variable": "MEDDL12M_A",
+      "label": "Delayed medical care because of cost (past 12 months)",
+      "short_label": "Cost-related delayed medical care",
+      "one": [
+        1
+      ],
+      "zero": [
+        2
+      ],
+      "codebook_page": 332,
+      "question_id": "UTZ.0100.00.1",
+      "recode": false,
+      "event": "delaying medical care because of cost during the past 12 months",
+      "definition": "For Sample Adults aged 18 years or older, this event is reporting a delay in getting medical care because of cost during the past 12 months.",
+      "code_labels": {
+        "1": "Yes",
+        "2": "No",
+        "7": "Refused",
+        "8": "Not ascertained",
+        "9": "Don't know"
+      },
+      "limitation": "This item measures cost-related delays only. A no response does not establish timely care or absence of other barriers; its complement is not an all-cause timely-care measure."
+    },
+    "unmet_care_cost": {
+      "missing": [
+        7,
+        8,
+        9
+      ],
+      "missing_reasons": {
+        "7": "Refused",
+        "8": "Not ascertained",
+        "9": "Don't know"
+      },
+      "universe": "Sample adults aged 18 years or older",
+      "universe_expression": "HHSTAT_A=1",
+      "time_window": "Past 12 months",
+      "codebook_url": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Dataset_Documentation/NHIS/2024/adult-codebook.pdf",
+      "codebook_version": "18 June 2025",
+      "denominator_note": "Use valid responses for this outcome within the requested population. Refused, not ascertained, unknown, blank and system-missing responses are excluded, not coded as absence of the event.",
+      "system_missing_policy": "Exclude blank or system-missing values; never recode them to zero.",
+      "variable": "MEDNG12M_A",
+      "label": "Needed medical care but did not get it because of cost (past 12 months)",
+      "short_label": "Cost-related unmet medical care",
+      "one": [
+        1
+      ],
+      "zero": [
+        2
+      ],
+      "codebook_page": 333,
+      "question_id": "UTZ.0110.00.1",
+      "recode": false,
+      "event": "needing medical care but not getting it because of cost during the past 12 months",
+      "definition": "For Sample Adults aged 18 years or older, this event is needing medical care but not obtaining it because of cost during the past 12 months.",
+      "code_labels": {
+        "1": "Yes",
+        "2": "No",
+        "7": "Refused",
+        "8": "Not ascertained",
+        "9": "Don't know"
+      },
+      "limitation": "This item measures unmet need because of cost only. Its denominator is all valid respondents in the target population, not only people reporting a need for care. A no response does not establish that all needed care was obtained promptly."
     }
   },
   "groups": {

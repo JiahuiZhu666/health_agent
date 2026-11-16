@@ -317,6 +317,17 @@
     return (!label || /\p{Script=Han}/u.test(label)) ? labels[event.stage] || 'Execution step' : label;
   }
 
+  function resultOutcome(result) {
+    const code = result.spec?.outcome || 'fair_poor', descriptor = result.survey?.outcome;
+    const definitions = state?.registry?.outcomes || {};
+    const registered = Array.isArray(definitions) ? definitions.find((item) => item.id === code) : definitions[code];
+    const source = descriptor && typeof descriptor === 'object' ? descriptor : null;
+    const matches = code === 'fair_poor' ? !source || (!source.id || source.id === code) : !!source && (source.id || source.code) === code && typeof source.variable === 'string';
+    const consistent = matches && (!registered?.variable || !source?.variable || source.variable === registered.variable);
+    return {code, matches: consistent, label: registered?.label || source?.label || (code === 'fair_poor' ? 'Fair or poor self-rated health' : 'Registered outcome'),
+      definition: registered?.definition || source?.definition || '', limitation: registered?.limitation || source?.limitation || ''};
+  }
+
   function releasedChart(spec) {
     const units = {proportion: 'percent', gradient: 'percentage_points', regression: 'odds_ratio'};
     if (!spec || !Object.hasOwn(units, spec.kind) || spec.unit !== units[spec.kind] || !runPattern.test(spec.source_run_id || '') || (spec.status && spec.status !== 'ok')) return null;
@@ -329,7 +340,7 @@
       return row.low > 0 && Number.isFinite(Math.log(row.low)) && Number.isFinite(Math.log(row.high));
     }).map((row) => ({...row, label: String(row.label || row.group_id || 'Unnamed group').slice(0, 240)}));
     if (!released.length) return null;
-    return {...spec, title: String(spec.title || 'NHIS survey estimates').slice(0, 240), subtitle: String(spec.subtitle || '').slice(0, 600),
+    return {...spec, title: String(spec.title || 'NHIS survey estimates').slice(0, 240), subtitle: String(spec.subtitle || '').slice(0, 1000),
       groups: released, omitted: groups.length - released.length, reference: spec.kind === 'regression' ? 1 : 0,
       style: spec.kind === 'regression' ? 'forest' : spec.style === 'bar' ? 'bar' : 'point'};
   }
@@ -410,7 +421,7 @@
       svg.append(group); rowTop += rowHeights[index];
     });
     const suppliedLabel = String(chart.x_label || '').slice(0, 160);
-    const axisLabel = chart.kind === 'regression' ? `${suppliedLabel || 'Adjusted odds ratio (log scale)'} · reference = 1` : chart.kind === 'gradient' ? `${suppliedLabel || 'Difference (percentage points)'} · reference = 0` : suppliedLabel || 'Fair or poor self-rated health (%)';
+    const axisLabel = chart.kind === 'regression' ? `${suppliedLabel || 'Adjusted odds ratio (log scale)'} · reference = 1` : chart.kind === 'gradient' ? `${suppliedLabel || 'Difference (percentage points)'} · reference = 0` : suppliedLabel || `${chart.outcome?.label || 'Fair or poor self-rated health'} (%)`;
     svg.append(svgNode('text', {x: (left + right) / 2, y: bottom + 45, 'text-anchor': 'middle', 'font-size': 11}, axisLabel), svgNode('text', {x: 16, y: height - 19, fill: '#737373', 'font-size': 10}, `NHIS 2024 · Descriptive associations, not causal effects.${chart.omitted ? ` ${chart.omitted} unavailable group${chart.omitted === 1 ? '' : 's'} omitted.` : ''}`));
     return {svg, width, height};
   }
@@ -668,22 +679,27 @@
 
   function renderResults(result) {
     $('results').hidden = false;
-    text($('result-answer'), publicGuidance(result.answer || 'See the status and available output for this analysis.'));
+    const outcome = resultOutcome(result);
+    text($('outcome-chart-title'), outcome.label);
+    text($('result-proportion-label'), outcome.code === 'fair_poor' ? 'Weighted proportion' : outcome.label);
+    text($('measurement-title'), outcome.code === 'fair_poor' ? 'Model estimates and survey evidence' : `${outcome.label}: model estimates and survey evidence`);
+    $('ci-chart').setAttribute('aria-label', `${outcome.label}: survey-weighted proportions, 95% confidence intervals, and model means`);
+    text($('result-answer'), outcome.matches ? publicGuidance(result.answer || 'See the status and available output for this analysis.') : 'The recorded outcome descriptor does not match the requested event. Estimates cannot be relabeled as another outcome.');
     const sourceSurvey = result.survey || {};
-    const canPublish = result.status === 'ok' && sourceSurvey.status === 'ok';
+    const canPublish = result.status === 'ok' && sourceSurvey.status === 'ok' && outcome.matches;
     const survey = canPublish ? sourceSurvey : {rows: [], message: sourceSurvey.message || sourceSurvey.reason || '', regression: sourceSurvey.regression ? {status: 'blocked', reason: sourceSurvey.regression.reason || 'This analysis did not pass the release checks'} : undefined};
     const rows = asArray(survey.rows);
     const hasResults = rows.length > 0;
     const regression = survey.regression || {};
     const hasDerived = (regression.status === 'ok' && asArray(regression.coefficients).length > 0) || asArray(survey.gradient?.contrasts).length > 0;
-    text($('result-badge'), result.status === 'ok' ? 'Analysis complete' : result.status === 'clarify' ? 'Clarification needed' : 'Calculation blocked');
-    $('result-badge').className = `pill ${result.status === 'ok' ? 'ready' : 'error'}`;
+    text($('result-badge'), !outcome.matches ? 'Outcome check failed' : result.status === 'ok' ? 'Analysis complete' : result.status === 'clarify' ? 'Clarification needed' : 'Calculation blocked');
+    $('result-badge').className = `pill ${result.status === 'ok' && outcome.matches ? 'ready' : 'error'}`;
     $('results-empty').hidden = true;
     $('results-content').hidden = false;
     const context = $('result-context'); context.replaceChildren();
     const spec = result.spec || {};
     addTag(context, spec.population || spec.age_range || 'Adults aged 25–64');
-    addTag(context, spec.outcome === 'fair_poor' ? 'Fair or poor self-rated health' : spec.outcome || spec.indicator || 'Fair or poor self-rated health');
+    addTag(context, outcome.label);
     const groupLabels = {overall: 'All adults', education: 'Education', race: 'Race and Hispanic ethnicity', sex: 'Sex', age: 'Age group', education_race: 'Education × race and Hispanic ethnicity', income: 'Income-to-poverty category'};
     const stratification = spec.stratify_by || spec.stratification || spec.grouping || groupLabels[spec.group_by];
     if (spec.analysis) addTag(context, {proportion: 'Group proportions', gradient: 'Group gradients · risk differences', regression: 'Adjusted regression · OR'}[spec.analysis] || spec.analysis);
@@ -714,8 +730,8 @@
     $('ci-chart').previousElementSibling.hidden = !hasResults;
     renderChart(rows, canPublish ? asArray(result.comparison) : []);
     const note = survey.method || survey.methodology || survey.methods?.proportion_ci || survey.message || '';
-    text($('survey-note'), (typeof note === 'string' ? note : JSON.stringify(note)) + (hasResults ? '  n is the analysis sample size. Proportions and standard errors are survey-weighted. Group differences are descriptive associations, not causal effects.' : ''));
-    renderDerived(survey);
+    text($('survey-note'), (outcome.code !== 'fair_poor' ? [outcome.definition, outcome.limitation].filter(Boolean).join(' ') + ' ' : '') + (typeof note === 'string' ? note : JSON.stringify(note)) + (hasResults ? '  n is the analysis sample size. Proportions and standard errors are survey-weighted. Group differences are descriptive associations, not causal effects.' : ''));
+    renderDerived(survey, outcome);
     renderMeasurement(result);
     text($('run-id'), result.run_id ? `RUN / ${result.run_id}` : '');
     $('artifact-links').replaceChildren();
@@ -729,7 +745,7 @@
     }
   }
 
-  function renderDerived(survey) {
+  function renderDerived(survey, outcome = {code: 'fair_poor'}) {
     const host = $('derived-results'); host.replaceChildren();
     const scalar = (value) => finite(value) ? value.toFixed(3) : '—';
     const pp = (value) => finite(value) ? `${value > 0 ? '+' : ''}${(value * 100).toFixed(2)}` : '—';
@@ -756,7 +772,8 @@
         const ok = row.status === 'ok';
         return [rowLabel(row, 'Unnamed contrast'), ok ? pp(row.estimate) : '—', ok ? sePP(row.se) : '—', ok ? `${pp(row.ci_low)} – ${pp(row.ci_high)}` : '—', ok ? 'Passed' : row.suppression_reason || row.status || 'Not estimated'];
       });
-      addSection(gradient.reference === '400_plus' ? 'Income gradient: risk differences relative to 400%+ of the poverty threshold' : 'Education gradient: risk differences relative to a bachelor’s degree or higher', 'Values are in percentage points. Confidence intervals use joint survey covariance; income analyses also include imputation variance. Unadjusted differences are not causal effects.', ['Group contrast', 'Risk difference (pp)', 'SE (pp)', '95% confidence interval', 'Status'], rows);
+      const title = gradient.reference === '400_plus' ? 'Income gradient: risk differences relative to 400%+ of the poverty threshold' : 'Education gradient: risk differences relative to a bachelor’s degree or higher';
+      addSection(title + (outcome.code === 'fair_poor' ? '' : ` · ${outcome.label}`), 'Values are in percentage points. Confidence intervals use joint survey covariance; income analyses also include imputation variance. Unadjusted differences are not causal effects.', ['Group contrast', 'Risk difference (pp)', 'SE (pp)', '95% confidence interval', 'Status'], rows);
     }
     const regression = survey.regression;
     if (regression) {
@@ -766,11 +783,11 @@
       if (regression.formula) note += ` Model: ${regression.formula}. `;
       if (ok && regression.references) note += ` Reference groups: ${Object.entries(regression.references).map(([key, value]) => `${key}=${value}`).join('; ')}. `;
       if (ok && regression.adjustment) note += ` Adjustment: ${regression.adjustment}. `;
-      addSection('Survey-design-adjusted regression', note, ['Term', 'Adjusted OR', '95% CI for OR', 'Log odds', 'SE(Log odds)', 'Degrees of freedom'], rows);
+      addSection('Survey-design-adjusted regression' + (outcome.code === 'fair_poor' ? '' : ` · ${outcome.label}`), note, ['Term', 'Adjusted OR', '95% CI for OR', 'Log odds', 'SE(Log odds)', 'Degrees of freedom'], rows);
       if (ok && regression.unadjusted) {
         const unadjusted = regression.unadjusted;
         const unadjustedRows = asArray(unadjusted.coefficients).map((row) => [row.term, scalar(row.odds_ratio), `${scalar(row.ci_low)} – ${scalar(row.ci_high)}`, scalar(row.log_odds), scalar(row.se), scalar(row.df)]);
-        addSection('Unadjusted education model on the same sample', `Uses the same analysis sample as the adjusted model, n=${number(unadjusted.n ?? regression.n)}. Unadjusted ORs are not risk ratios or causal effects. Model: ${unadjusted.formula || 'See run record'}.`, ['Term', 'Unadjusted OR', '95% CI for OR', 'Log odds', 'SE(Log odds)', 'Degrees of freedom'], unadjustedRows);
+        addSection('Unadjusted education model on the same sample' + (outcome.code === 'fair_poor' ? '' : ` · ${outcome.label}`), `Uses the same analysis sample as the adjusted model, n=${number(unadjusted.n ?? regression.n)}. Unadjusted ORs are not risk ratios or causal effects. Model: ${unadjusted.formula || 'See run record'}.`, ['Term', 'Unadjusted OR', '95% CI for OR', 'Log odds', 'SE(Log odds)', 'Degrees of freedom'], unadjustedRows);
       }
     }
     const checks = survey.checks;
@@ -782,7 +799,7 @@
   }
 
   function renderMeasurement(result) {
-    const canPublish = result.status === 'ok' && result.survey?.status === 'ok';
+    const canPublish = result.status === 'ok' && result.survey?.status === 'ok' && resultOutcome(result).matches;
     const comparison = canPublish ? asArray(result.comparison) : [];
     const gradients = canPublish ? asArray(result.gradient_comparison) : [];
     const measurement = canPublish ? result.measurement || {} : {status: 'blocked', message: 'This analysis did not pass release checks. Model comparison values are not shown.'};

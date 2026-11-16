@@ -99,6 +99,16 @@ test('Known category, cross-group, and contrast labels are English without chang
   assert.equal(context.processLabel({stage: 'statistics', label: 'Survey computation'}), 'Survey computation');
 });
 
+test('Outcome headings use registered event labels and check the source descriptor', () => {
+  context.state = {registry: {outcomes: {insured: {id: 'insured', label: 'Insured at interview', variable: 'NOTCOV_A'}}}};
+  const result = {spec: {outcome: 'insured'}, survey: {outcome: {id: 'insured', variable: 'NOTCOV_A', label: 'Insured at interview'}}};
+  assert.equal(context.resultOutcome(result).label, 'Insured at interview'); assert.equal(context.resultOutcome(result).matches, true);
+  result.survey.outcome.variable = 'PHSTAT_A'; assert.equal(context.resultOutcome(result).matches, false);
+  result.survey.outcome = {id: 'uninsured', variable: 'NOTCOV_A'}; assert.equal(context.resultOutcome(result).matches, false);
+  assert.equal(context.resultOutcome({spec: {}, survey: {}}).label, 'Fair or poor self-rated health');
+  assert.match(html, /id="outcome-chart-title"/); assert.match(html, /cost during the past 12 months/);
+});
+
 test('Observed process facts retain real denominators and use English units', () => {
   const facts = {full_sample_n: 1234, age_domain_n: 900, filtered_domain_n: 321, valid_outcome_n: 300,
     released_groups: 2, suppressed_groups: 1, planned_calls: 15, valid_calls: 14, cache_hit: false, elapsed_ms: 1250};

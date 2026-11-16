@@ -7,7 +7,8 @@ import html
 import math
 import re
 
-from .answers import LABELS as CATEGORY_LABELS, scope_name, category_name, _same_sample
+from .answers import (LABELS as CATEGORY_LABELS, scope_name, category_name, _same_sample,
+                      outcome_metadata, outcome_coding, outcome_caution, outcome_matches)
 
 GROUP_LABELS = {'overall': 'overall population', 'education': 'education', 'income': 'income',
                 'race': 'race/ethnicity', 'sex': 'sex', 'age': 'age group',
@@ -129,12 +130,24 @@ def _scope(current):
     return scope_name(spec if isinstance(spec, dict) else {})
 
 
+def _spec(current):
+    return current.get('spec', {}) if isinstance(current, dict) and isinstance(current.get('spec'), dict) else {}
+
+
+def _event(current):
+    return outcome_metadata(_spec(current))['label']
+
+
+def _custom(current):
+    return _spec(current).get('outcome', 'fair_poor') != 'fair_poor'
+
+
 def _example(current):
     rows = _rows(current)
     if not rows:
         return None
     row = rows[0]
-    text = 'For **' + _row_name(row) + '**, the survey-weighted proportion is **' + _pct(row['estimate']) + '**'
+    text = 'For **' + _row_name(row) + '**, the survey-weighted proportion' + (' for ' + _event(current).lower() if _custom(current) else '') + ' is **' + _pct(row['estimate']) + '**'
     if _ci(row):
         text += ', with a 95% interval of **' + _pct(row['ci_low']) + '–' + _pct(row['ci_high']) + '**'
     if _finite(row.get('n')):
@@ -203,6 +216,8 @@ def _sample(current):
             lines.append('- ' + label + ': unweighted n=' + _num(denominators[key]) + '.')
     parts = [('Keep the denominators distinct', 'Unweighted n counts actual respondents. A weighted denominator describes their represented population, while the valid analysis denominator also depends on the outcome and required variables. These quantities are not interchangeable.'),
              ('Recorded sample flow', '\n'.join(lines) if lines else 'The complete sample-flow counts were not recorded. Adding the displayed groups does not reconstruct the overall denominator.')]
+    if _custom(current):
+        parts.insert(0, ('Current outcome and valid denominator', outcome_coding(_spec(current)) + ' ' + outcome_caution(_spec(current))))
     table = ['| Group | Unweighted n |', '|---|---:|']
     for row in _rows(current)[:8]:
         if _finite(row.get('n')):
@@ -212,7 +227,7 @@ def _sample(current):
                 count += ' (range ' + interval + ')'
             table.append('| ' + _row_name(row) + ' | ' + count + ' |')
     if len(table) > 2:
-        parts.append(('Actual denominators for released groups', '\n'.join(table)))
+        parts.append(('Actual denominators for released groups' + (' · ' + _event(current) if _custom(current) else ''), '\n'.join(table)))
     regression = survey.get('regression', {})
     if regression.get('status') == 'ok' and _finite(regression.get('n')):
         body = 'The complete-case regression denominator is **n=' + _num(regression['n']) + '**.'
@@ -255,7 +270,7 @@ def _mi(current):
 
 def _steps(current):
     survey = _survey(current)
-    parts = [('1. Fix the question and population', _scope(current) + ' The outcome is fair or poor self-rated health. Grouping, missing-data rules and model formulas come from the registered specification, rather than being changed after inspecting results.')]
+    parts = [('1. Fix the question and population', _scope(current) + ' The outcome is ' + _event(current).lower() + '. Grouping, missing-data rules and model formulas come from the registered specification, rather than being changed after inspecting results.')]
     design = survey.get('design', {})
     body = 'Construct the survey design on the full adult file with `WTFA_A` weights, `PSTRAT` strata and `PPSU` sampling units before restricting it to the analysis domain.'
     body += ' This record confirms that order.' if design.get('constructed_before_domain_subset') is True else ' This is the registered method; this excerpt does not contain a design flag sufficient to confirm its execution.'
@@ -263,6 +278,8 @@ def _steps(current):
     if _finite(count): body += ' The recorded full sample is n=' + _num(count) + '.'
     parts.append(('2. Retain the full design before subsetting', body))
     body = 'Code `PHSTAT_A=4 or 5` as 1 and `1, 2 or 3` as 0. Refused, don’t-know and not-ascertained responses are excluded, not counted as healthy. Each proportion uses valid outcomes and the variables required for its grouping.'
+    if _custom(current):
+        body = outcome_coding(_spec(current)) + ' Each proportion also requires valid grouping variables.'
     for key, label in [('age_domain_n', 'Age domain'), ('filtered_domain_n', 'Filtered domain'), ('valid_outcome_n', 'Valid-outcome denominator')]:
         count = survey.get('denominators', {}).get(key)
         if _finite(count): body += '\n- ' + label + ': n=' + _num(count) + '.'
@@ -302,6 +319,8 @@ def _steps(current):
     if isinstance(digest, str) and re.fullmatch(r'[a-f0-9]{64}', digest): evidence.append('An input-file SHA256 is saved and can be matched to the local data record.')
     evidence.append('Only estimates passing reliability checks are released. R/Stata numerical agreement and the external NCHS comparison still require independent validation.')
     parts.append(('6. Check reliability and retain the audit record', '\n\n'.join(evidence)))
+    if _custom(current):
+        parts.append(('7. Interpret only the registered event', outcome_caution(_spec(current))))
     return _sections(parts), 'method'
 
 
@@ -328,7 +347,7 @@ def _regression(current, significance=False):
     parts = [('Distinguish odds ratios from proportions', 'A logistic-regression OR is a **ratio of odds** relative to a reference category, not a population proportion or a risk ratio. An adjusted OR describes association under the registered covariate model; it cannot be directly converted to a risk difference or causal effect.')]
     if regression.get('status') == 'ok' and terms:
         term = terms[0]
-        parts.append(('Use a recorded coefficient as an example', 'For **' + _term_label(term['term']) + '**, the adjusted OR is **' + f'{term["odds_ratio"]:.3f}' + '** (95% interval **' + f'{term["ci_low"]:.3f}–{term["ci_high"]:.3f}' + '**). The direction is relative to the registered reference group; it is not that group’s absolute probability of poor health.'))
+        parts.append(('Use a recorded coefficient as an example', 'For **' + _term_label(term['term']) + '**, the adjusted OR is **' + f'{term["odds_ratio"]:.3f}' + '** (95% interval **' + f'{term["ci_low"]:.3f}–{term["ci_high"]:.3f}' + '**). The modeled event is ' + _event(current).lower() + '. The direction is relative to the registered reference group; it is not that group’s absolute probability of ' + (_event(current).lower() if _custom(current) else 'poor health') + '.'))
         sample = []
         if _finite(regression.get('n')):
             sample.append('Complete-case n=' + _num(regression['n']) + '.')
@@ -337,7 +356,7 @@ def _regression(current, significance=False):
         if isinstance(regression.get('formula'), str): sample.append('The registered formula is `' + _clean(regression['formula']) + '`.')
         if sample: parts.append(('Adjustment and analysis sample', ' '.join(sample)))
         if significance:
-            table = ['| Model term | Adjusted OR | 95% interval | Includes 1? |', '|---|---:|---|---|']
+            table = ['| Model term | Adjusted OR' + (': ' + _event(current) if _custom(current) else '') + ' | 95% interval | Includes 1? |', '|---|---:|---|---|']
             for row in terms[:5]: table.append('| ' + _term_label(row['term']) + ' | ' + f'{row["odds_ratio"]:.3f}' + ' | ' + f'{row["ci_low"]:.3f}–{row["ci_high"]:.3f}' + ' | ' + ('Yes' if row['ci_low'] <= 1 <= row['ci_high'] else 'No') + ' |')
             parts.append(('Use the appropriate null reference', '\n'.join(table)))
     else: parts.append(('Limits of the current record', 'No released regression coefficient is available to quote. A proportion table does not generate adjusted ORs. This is a method explanation, not evidence that a new model was fitted.'))
@@ -348,7 +367,7 @@ def _regression(current, significance=False):
 def _significance(current):
     contrasts = _contrasts(current)
     if contrasts:
-        table = ['| Contrast | Difference (percentage points) | 95% difference interval | Includes 0? |', '|---|---:|---|---|']
+        table = ['| Contrast | Difference' + (' in ' + _event(current).lower() if _custom(current) else '') + ' (percentage points) | 95% difference interval | Includes 0? |', '|---|---:|---|---|']
         for row in contrasts[:6]: table.append('| ' + _contrast_name(row) + ' | ' + _pp(row['estimate']) + ' | ' + _pp(row['ci_low']) + ' to ' + _pp(row['ci_high']) + ' | ' + ('Yes' if row['ci_low'] <= 0 <= row['ci_high'] else 'No') + ' |')
         return _sections([('The recorded difference intervals can be assessed directly', '\n'.join(table)), ('Why use these intervals?', 'A difference variance includes covariance between the group estimates. Whether its 95% interval includes 0 addresses uncertainty in that registered contrast; overlap of marginal intervals is not a substitute.'), ('Limits of the conclusion', 'Including 0 does not establish no association; excluding 0 does not establish causation. No new p-values or multiplicity corrections are generated here.')]), 'explanation'
     if _terms(current): return _regression(current, True)
@@ -363,7 +382,8 @@ def _summary(current):
     if len(rows) == 1: parts.append(_example(current) or 'The cell was released but its explanatory fields are incomplete.')
     else:
         low, high = min(rows, key=lambda row: row['estimate']), max(rows, key=lambda row: row['estimate'])
-        parts.append('Among released groups, **' + _row_name(high) + '** reports fair or poor health most often (' + _pct(high['estimate']) + '), compared with ' + _pct(low['estimate']) + ' for **' + _row_name(low) + '**. The point-estimate gap is **' + f'{(high["estimate"] - low["estimate"]) * 100:.2f}' + ' percentage points**. Suppressed cells are excluded.')
+        comparison = 'has the highest weighted proportion for ' + _event(current).lower() if _custom(current) else 'reports fair or poor health most often'
+        parts.append('Among released groups, **' + _row_name(high) + '** ' + comparison + ' (' + _pct(high['estimate']) + '), compared with ' + _pct(low['estimate']) + ' for **' + _row_name(low) + '**. The point-estimate gap is **' + f'{(high["estimate"] - low["estimate"]) * 100:.2f}' + ' percentage points**. Suppressed cells are excluded.')
     if contrasts:
         row = contrasts[0]
         parts.append('For the registered ' + _contrast_name(row) + ' comparison, the difference is **' + _pp(row['estimate']) + ' percentage points** (95% difference interval **' + _pp(row['ci_low']) + ' to ' + _pp(row['ci_high']) + '**), using joint survey covariance. ' +
@@ -371,7 +391,7 @@ def _summary(current):
                       'The interval excludes zero, supporting a difference in this comparison.'))
     elif len(rows) > 1:
         parts.append('That gap does not establish statistical significance without its joint variance. Separate group intervals are not a test of the difference.')
-    parts[-1] += ' This describes self-rated health, not a clinical diagnosis, and cannot establish causation.'
+    parts[-1] += (' ' + outcome_caution(_spec(current)) + ' These descriptive associations cannot establish causation.' if _custom(current) else ' This describes self-rated health, not a clinical diagnosis, and cannot establish causation.')
     measurement = current.get('measurement', {})
     if measurement.get('status') in ('partial', 'failed', 'blocked'):
         counts = ''
@@ -387,6 +407,8 @@ def build_explanation(text, current, previous=None):
     if intent is None: return None
     if isinstance(current, dict) and (current.get('status') in ('blocked', 'failed', 'clarify') or _survey(current).get('status') == 'blocked'): return _blocked(current)
     current = current or {}
+    if _custom(current) and not outcome_matches(_survey(current), _spec(current)):
+        return _sections([('A matching outcome record is required', 'The saved result does not identify the registered outcome and source variable. Existing estimates cannot be relabeled as another event. Run the intended specification before interpreting its values.')]), 'clarification'
     if intent == 'steps':
         answer, kind = _steps(current)
         if re.search(r'详细一点|再详细点|讲详细点|详细解释|展开讲讲|继续解释|具体一点|展开说|多说一点|more detail|elaborate|break it down', text.lower()): kind = 'explanation'
@@ -408,11 +430,15 @@ def build_explanation(text, current, previous=None):
     if intent == 'floor': return _sections([('The floor of 100 is not a health proportion', 'The registered application rule suppresses cells with unweighted n<100. Sparse estimates may be unstable for group comparisons.'), ('Reaching 100 is not sufficient', 'Event and non-event counts, design degrees of freedom, effective sample size, relative standard error and interval width must also pass checks.'), ('What a missing value means', 'Suppression means neither a zero proportion nor an absence of health differences. These are conservative application checks, not certification of the full NCHS presentation standards.')]), 'method'
     if intent == 'variables':
         parts = [('Outcome and grouping variables', '`PHSTAT_A` records self-rated health; 4 or 5 defines fair or poor. Registered groupings use `EDUCP_A` for education, income-to-poverty categories, `HISPALLP_A` for race/ethnicity, `AGEP_A` for age and `SEX_A` for sex.'), ('Survey-design variables', '`WTFA_A` is the final annual weight; `PSTRAT` and `PPSU` are the public-use pseudo-strata and pseudo-PSUs. They affect population estimates and their variances.')]
+        if _custom(current):
+            parts[0] = ('Outcome and grouping variables', outcome_coding(_spec(current)) + ' Registered groupings use `EDUCP_A` for education, income-to-poverty categories, `HISPALLP_A` for race/ethnicity, `AGEP_A` for age and `SEX_A` for sex. ' + outcome_caution(_spec(current)))
         if current.get('spec'): parts.append(('Specification used for this result', _scope(current) + ' Full and explicitly reduced no-income models remain distinct.'))
         return _sections(parts), 'method'
-    if intent == 'weights': return _sections([('Why a headcount fraction is insufficient', 'Respondents represent different shares of the population. The weighted proportion is `Σ(weight × fair-or-poor indicator) / Σweight`; the denominator includes valid outcomes and required grouping values within the current domain.'), ('Reading the recorded result', _example(current) or 'No released proportion is available to quote. The formula describes the registered method, not a new estimate.'), ('Weights do not create independent respondents', 'Standard errors still account for strata and PSUs. A large weight does not turn a respondent into additional independent observations. Unweighted n, the weighted population denominator and effective sample size have different meanings.')]), 'method'
+    if intent == 'weights': return _sections([('Why a headcount fraction is insufficient', 'Respondents represent different shares of the population. The weighted proportion is `Σ(weight × ' + ('outcome indicator' if _custom(current) else 'fair-or-poor indicator') + ') / Σweight`; the denominator includes valid outcomes and required grouping values within the current domain.' + (' The event is ' + _event(current).lower() + '.' if _custom(current) else '')), ('Reading the recorded result', _example(current) or 'No released proportion is available to quote. The formula describes the registered method, not a new estimate.'), ('Weights do not create independent respondents', 'Standard errors still account for strata and PSUs. A large weight does not turn a respondent into additional independent observations. Unweighted n, the weighted population denominator and effective sample size have different meanings.')]), 'method'
     if intent == 'sample_filter':
         parts = [('Build the design before defining the domain', 'Retain the complete adult public-use sample for the complex survey design, then restrict the analysis to ages 25–64 and the selected categories. Do not first drop other ages and rebuild a simplified design.'), ('Which records enter the denominator?', 'The binary outcome uses valid PHSTAT_A responses. Descriptive proportions require the variables relevant to their grouping. Regressions use complete cases for the registered model, with the unadjusted and adjusted models sharing the analysis sample.')]
+        if _custom(current):
+            parts[1] = ('Which records enter the denominator?', outcome_coding(_spec(current)) + ' Descriptive proportions also require valid relevant grouping variables. Regressions require complete cases for the registered covariates. ' + outcome_caution(_spec(current)))
         if current.get('spec'): parts.append(('Current restrictions', _scope(current) + ' Use recorded sample-flow counts rather than summing group tables.'))
         return _sections(parts), 'method'
     if intent == 'suppression':

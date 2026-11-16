@@ -3,6 +3,7 @@ import datetime as dt
 import json
 import time
 from pathlib import Path
+from .outcomes import get_outcome
 
 LABELS = {
     'understand': 'Understand the question', 'scope': 'Confirm the research scope', 'data': 'Verify real data',
@@ -22,6 +23,7 @@ CATEGORY_LABELS = {
 
 
 def describe_spec(spec):
+    outcome = get_outcome(spec.get('outcome','fair_poor'))
     filters = []
     for dimension, values in spec.get('filters', {}).items():
         if isinstance(values, str):
@@ -31,7 +33,7 @@ def describe_spec(spec):
             'gradient':'Group prevalence differences and 95% confidence intervals',
             'regression':'Complex-survey logistic regression'}[spec.get('analysis', 'proportion')]
     return {'population':'U.S. civilian noninstitutionalized adults aged 25–64', 'year':2024,
-            'outcome':'Fair or poor self-rated health (PHSTAT_A=4 or 5)',
+            'outcome':outcome['label'] + ' (' + outcome['variable'] + '=' + ' or '.join(str(code) for code in outcome['one']) + ')',
             'group_by':GROUP_LABELS.get(spec.get('group_by', 'overall'), 'All adults'),
             'filters':filters, 'method':mode, 'confidence':'95%', 'minimum_n':100,
             'design':'Build the full adult survey design before subsetting domains; WTFA_A / PSTRAT / PPSU',

@@ -25,17 +25,52 @@ def fingerprint(spec):
     return hashlib.sha256(json.dumps(spec, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
+def requested_outcomes(question):
+    """Select named registered events without treating no cost barrier as timely care."""
+    q = str(question).lower()
+    selected = []
+    if re.search(r'自评健康|self.?rated|fair.{0,5}poor|phstat_a',q):
+        selected.append('fair_poor')
+    insurance = re.search(r'保险|医保|参保|\binsurance\b|\binsured\b|\buninsured\b|notcov_a',q) and not re.search(r'车险|寿险|财产保险|旅游保险|\b(?:car|auto|life|home|property|travel) insurance\b',q)
+    if insurance:
+        uninsured = re.search(r'未参保|未投保|没有.{0,4}(?:医保|保险)|无医保|无保险|\buninsured\b|without (?:health )?insurance|not covered',q)
+        insured = re.search(r'有无|是否|coverage|covered|有医保|有保险|\binsured\b',q)
+        if uninsured and not insured and not re.search(r'有无|whether',q):
+            selected.append('uninsured')
+        else:
+            selected.extend(('insured','uninsured'))
+    if re.search(r'meddl12m_a|延迟.{0,5}(?:就医|医疗|看病)|推迟.{0,5}(?:就医|医疗|看病)|\bdelay(?:ed|ing)?\b.{0,25}(?:care|medical|treatment)',q):
+        selected.append('delayed_care_cost')
+    if re.search(r'medng12m_a|未就医|未获得.{0,8}(?:医疗|服务)|未能.{0,5}(?:就医|看病)|无法.{0,5}(?:就医|看病)|'
+                 r'未满足.{0,5}(?:医疗|需求)|\bunmet\b.{0,20}(?:care|medical|need)|(?:forgo|forego|forgone|foregone|without|did not get|not get).{0,25}(?:medical|needed care)',q):
+        selected.append('unmet_care_cost')
+    timely = re.search(r'及时就医|及时.{0,5}(?:医疗|看病)|timely.{0,12}(?:care|medical)|access to (?:medical |health )?care',q)
+    broad = re.search(r'医疗服务指标|医疗服务.{0,10}分布|医疗可及性|医疗服务可及性|health.?care (?:access|service) (?:indicators?|measures?)',q)
+    if broad:
+        selected.extend(('insured','uninsured','delayed_care_cost','unmet_care_cost'))
+    elif timely:
+        selected.extend(('delayed_care_cost','unmet_care_cost'))
+    elif re.search(r'就医费用障碍|医疗费用障碍|cost.?related barriers|cost barriers',q):
+        selected.extend(('delayed_care_cost','unmet_care_cost'))
+    return list(dict.fromkeys(selected))
+
+
 def route(question):
     if not isinstance(question, str) or not question.strip():
         return {'status': 'clarify', 'answer': 'Enter a research question, such as “Compare fair/poor self-rated health by education among adults aged 25–64.”'}
     if len(question) > 2000:
         return {'status': 'blocked', 'answer': 'Please keep the question within 2,000 characters.'}
     q = question.strip().lower()
+    outcomes = requested_outcomes(q)
+    if outcomes and re.search(r'premium|deductible|copay|coinsurance|保费|免赔|赔付|共付',q):
+        return {'status':'clarify','answer':'The verified tools measure insurance coverage and cost-related barriers to care. Premium, deductible, copayment, and claim amounts are separate measures that have not been added to these calculations.'}
+    if ('fair_poor' in outcomes and len(outcomes)>1 and re.search(r'correlation|relationship|association between|相关|关系',q)):
+        return {'status':'clarify','answer':'I can show the separate distributions of self-rated health, insurance, and cost-related access barriers. A relationship between those outcomes needs a separately checked cross-tabulation or model; I will not substitute their marginal distributions for that analysis.'}
     reasons = [
         (r'因果|导致|造成|causal|cause\b|治疗|处方|diagnos|treatment|服药', 'The survey tools estimate cross-sectional descriptions and associations, not causal effects, diagnoses, or treatments.'),
         (r'中国|加拿大|日本|英国|欧洲|美国之外|canad|china|japan|united kingdom|europe|outside the u\.?s|cfps|儿童|未成年|children|child\b|teen|孕妇|pregnan', 'The registered survey population is US NHIS 2024 Sample Adults aged 25–64. The requested population is outside that scope.'),
-        (r'费用|延迟就医|未就医|meddl|medng|cost barrier|移民|出生地|来美|immigra|nativity', 'Cost barriers and immigrant health are later project phases and are not registered for calculation. Self-rated health cannot substitute for those outcomes.'),
-        (r'糖尿病|高血压|癌症|diabetes|cancer|hypertension|死亡|mortality|抑郁|depress|肥胖|obesity|\bbmi\b|保险|insurance|残疾|disability|吸烟|smok', 'The registered outcome is PHSTAT_A fair/poor self-rated health, with education, income, age group, sex, and race/ethnicity. The requested outcome or covariate is not registered.'),
+        (r'移民|出生地|来美|immigra|nativity', 'Immigrant status and country of birth are not yet supported by the verified survey tools. I can analyze self-rated health, insurance coverage, and cost-related barriers to medical care.'),
+        (r'糖尿病|高血压|癌症|diabetes|cancer|hypertension|死亡|mortality|抑郁|depress|肥胖|obesity|\bbmi\b|残疾|disability|吸烟|smok', 'I can calculate self-rated health, insurance coverage, and cost-related delayed or unmet medical care from the verified data. The requested outcome or additional covariate has not been added to those tools yet.'),
         (r'州|县|城市|state-level|county|region|地区', 'The survey tools do not support regional or restricted geography analyses.'),
         (r'模拟|画像|persona|simulate', 'Profile simulation is not enabled. Blind model measurement uses aggregate proportion questions and only category definitions.'),
         (r'趋势|逐年|trend|多年', 'The registered analysis is a 2024 cross-section; multi-year trends are not enabled.'),
@@ -72,6 +107,9 @@ def route(question):
         'income': bool(re.search(r'收入|贫困|income|poverty', q)),
     }
     analysis = 'regression' if re.search(r'回归|logistic|regression|调整|校正|控制', q) else ('gradient' if re.search(r'梯度|gradient', q) else 'proportion')
+    if (analysis == 'regression' and 'fair_poor' in outcomes and any(code in ('insured','uninsured') for code in outcomes)
+            and re.search(r'adjust|control|调整|控制|校正',q)):
+        return {'status':'clarify','answer':'I can analyze insurance coverage as an outcome. Adding insurance as a predictor of self-rated health needs a separately checked model; the current adjusted model uses education, income, age group, sex, and race/ethnicity.'}
     if analysis == 'regression' and re.search(r'只调整|只控制|仅调整|仅控制|only adjust|only control|不含教育|不含年龄|不含性别|不含族裔', q):
         return {'status': 'clarify', 'answer': 'The registered regression includes education, income, age group, sex, and race/ethnicity. Choose the full model or explicitly request the registered model without income.'}
     if analysis == 'regression' and re.search(r'不含收入|不调整收入|不控制收入|排除收入|without income|excluding income', q):
@@ -115,15 +153,18 @@ def route(question):
         grouping = grouping[1:]
     if grouping and analysis != 'regression':
         return {'status': 'clarify', 'answer': 'Choose one grouping dimension, or education × race/ethnicity. Other characteristics can be restricted to specific categories.'}
-    if not any(dimension_hits.values()) and not re.search(r'健康|health|总体|整体|比例|自评|fair|poor', q):
+    if not any(dimension_hits.values()) and not outcomes and not re.search(r'健康|health|总体|整体|比例|自评|fair|poor', q):
         return {'status': 'clarify', 'answer': 'For survey calculation, specify the fair/poor self-rated health comparison by education, income, sex, race/ethnicity, or age group.'}
     if re.search(r'很好|非常好|excellent|very good|五分类|原始分布', q):
         return {'status': 'blocked', 'answer': 'The registered binary outcome is PHSTAT_A=4 or 5 (fair/poor). The five-category distribution is a different outcome and is not combined with it.'}
     spec = {
-        'version': VERSION, 'year': 2024, 'outcome': 'fair_poor', 'analysis': analysis,
+        'version': VERSION, 'year': 2024, 'outcome': outcomes[0] if outcomes else 'fair_poor', 'analysis': analysis,
         'group_by': group_by, 'filters': filters, 'min_n': 100, 'age_min': 25, 'age_max': 64,
         'confidence': 0.95, 'adjustment': 'full',
     }
     if analysis == 'regression' and re.search(r'不含收入|不调整收入|不控制收入|排除收入|without income|excluding income', q):
         spec['adjustment'] = 'no_income'
-    return {'status': 'ready', 'spec': spec, 'spec_hash': fingerprint(spec)}
+    result = {'status': 'ready', 'spec': spec, 'spec_hash': fingerprint(spec)}
+    if len(outcomes)>1:
+        result['outcomes'] = outcomes
+    return result

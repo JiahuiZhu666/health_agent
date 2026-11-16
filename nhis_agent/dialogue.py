@@ -8,6 +8,7 @@ import json
 import re
 
 from . import chat_api
+from .outcomes import allowed_outcomes
 
 HISTORY_LIMIT = 18
 MAX_HISTORY_CHARS = 2000
@@ -39,6 +40,11 @@ Return exactly one JSON object with mode and reply. The mode must be one of:
   Requests such as "do all those comparisons", "do them all" or "都做一遍" in
   the current research discussion are analysis requests, not invitations to repeat
   a menu or supply guessed results. The fixed service resolves the requested batch.
+  Supported outcomes include fair/poor self-rated health, insurance coverage at
+  interview, and delayed or unmet medical care due to cost during the past year.
+  Requests for their distributions or comparisons use analysis. General questions
+  about insurance or deductibles remain ordinary chat. Cost barriers are narrower
+  than all reasons why care might not be timely; do not equate those concepts.
 - explanation: the user asks about the current NHIS research result, survey
   methods, weights, confidence intervals, or how an NHIS result was calculated.
   Set reply to an empty string. A separate service will supply the actual evidence.
@@ -75,6 +81,7 @@ _CREDENTIAL = re.compile(
     r'(?:api[ _-]?key|access[ _-]?token|secret|password|密钥|密码)\s*[:=：]\s*[^\s,;，；。]{4,}', re.I)
 _LOCAL_PATH = re.compile(r'(?:/(?:Users|home|private|var|tmp)/|[A-Za-z]:\\(?:Users|Windows)\\)[^\s<>"\n]+')
 _SPEC_VALUES = {
+    'outcome':set(allowed_outcomes()),
     'analysis':{'proportion','gradient','regression'},
     'group_by':{'overall','education','income','race','sex','age','education_race'},
     'adjustment':{'full','no_income'},
@@ -122,7 +129,7 @@ def _research_context(value):
         for key, allowed in _SPEC_VALUES.items():
             if isinstance(spec.get(key),str) and spec[key] in allowed:
                 clean[key] = spec[key]
-        for key, fixed in (('year',2024),('outcome','fair_poor'),('age_min',25),('age_max',64),('min_n',100),('confidence',.95)):
+        for key, fixed in (('year',2024),('age_min',25),('age_max',64),('min_n',100),('confidence',.95)):
             if type(spec.get(key)) is type(fixed) and spec[key] == fixed:
                 clean[key] = fixed
         filters = spec.get('filters')
