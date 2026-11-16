@@ -1,0 +1,2 @@
+# Optional Streamlit interface. The default chat web interface uses Python 3.9+ only.
+streamlit>=1.50,<2

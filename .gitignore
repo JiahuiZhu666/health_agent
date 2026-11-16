@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.r-env/
+.env
+.env.*
+!.env.example
+.DS_Store
+.cache/
+conversations/
+data/*
+!data/.gitkeep
+runs/*
+!runs/.gitkeep

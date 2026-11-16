@@ -1,0 +1,52 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_container:
+        description: Build the production container without data or API calls
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11"]
+    env:
+      OPENAI_API_KEY: ""
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Isolated Python tests (no R, data download or live model calls)
+        run: python -m unittest discover -s tests -q
+      - name: Browser JavaScript checks
+        run: |
+          node --check web/app.js
+          node tests/test_web_english.js
+          node tests/test_web_markdown.js
+          node tests/test_web_deletion.js
+
+  container:
+    if: github.event_name == 'workflow_dispatch' && inputs.build_container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Build image (OS packages only; no data or credentials)
+        run: docker build --pull --tag nhis-lab:ci .

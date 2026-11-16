@@ -1,0 +1,28 @@
+# Free, ephemeral chat preview. See deploy/README.md before choosing paid storage.
+services:
+  - type: web
+    name: nhis-lab
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeployTrigger: "off"
+    healthCheckPath: /healthz
+    envVars:
+      - key: NHIS_HOST
+        value: 0.0.0.0
+      - key: NHIS_STATE_DIR
+        value: /var/lib/nhis
+      - key: NHIS_AUTO_DOWNLOAD_DATA
+        value: "false"
+      - key: NHIS_MODEL_PROVIDER
+        value: openai
+      - key: NHIS_MODEL_BASE_URL
+        value: https://api.openai.com/v1
+      - key: NHIS_MODEL_NAME
+        value: gpt-5.6-sol
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: WEB_AUTH_SECRET
+        sync: false

@@ -1,0 +1,19 @@
+[theme]
+base = "light"
+primaryColor = "#212121"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F9F9F9"
+textColor = "#212121"
+linkColor = "#0066CC"
+borderColor = "#D2D2D7"
+font = "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'PingFang SC', 'Helvetica Neue', sans-serif"
+codeFont = "ui-monospace, 'SF Mono', Menlo, monospace"
+baseRadius = "12px"
+buttonRadius = "full"
+showWidgetBorder = false
+
+[client]
+toolbarMode = "minimal"
+
+[server]
+runOnSave = true

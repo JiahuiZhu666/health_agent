@@ -1,0 +1,315 @@
+{
+  "registry_version": "2024.1",
+  "documentation_url": "https://www.cdc.gov/nchs/nhis/documentation/2024-nhis.html",
+  "verified_on": "2026-11-15",
+  "datasets": {
+    "adult_2024": {
+      "year": 2024,
+      "expected_rows": 32629,
+      "record_type": 10,
+      "url": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Datasets/NHIS/2024/adult24csv.zip",
+      "summary_url": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Dataset_Documentation/NHIS/2024/adult-summary.pdf",
+      "codebook_url": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Dataset_Documentation/NHIS/2024/adult-codebook.pdf",
+      "codebook_version": "18 June 2025",
+      "record_key": [
+        "HHX"
+      ]
+    },
+    "income_2024": {
+      "year": 2024,
+      "expected_rows": 326290,
+      "imputations": 10,
+      "record_type": 30,
+      "url": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Datasets/NHIS/2024/adultinc24csv.zip",
+      "summary_url": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Dataset_Documentation/NHIS/2024/adultinc-summary.pdf",
+      "record_key": [
+        "HHX",
+        "IMPNUM_A"
+      ],
+      "technical_document": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Dataset_Documentation/NHIS/2024/NHIS2024-imputation-techdoc-508.pdf"
+    }
+  },
+  "design": {
+    "weight": "WTFA_A",
+    "strata": "PSTRAT",
+    "psu": "PPSU",
+    "nest": true,
+    "variance": "Taylor linearization, with replacement at the first stage; no finite population correction",
+    "domain": {
+      "variable": "AGEP_A",
+      "minimum": 25,
+      "maximum": 64
+    },
+    "construct_before_domain_filter": true,
+    "lonely_psu_policy": "fail on single-PSU full-sample strata"
+  },
+  "outcomes": {
+    "fair_poor": {
+      "variable": "PHSTAT_A",
+      "label": "Fair or poor self-rated health",
+      "one": [
+        4,
+        5
+      ],
+      "zero": [
+        1,
+        2,
+        3
+      ],
+      "missing": [
+        7,
+        8,
+        9
+      ],
+      "codebook_page": 32
+    }
+  },
+  "groups": {
+    "education": {
+      "variable": "EDUCP_A",
+      "missing": [
+        97,
+        98,
+        99
+      ],
+      "codebook_page": 26,
+      "categories": [
+        {
+          "id": "less_than_high_school",
+          "label": "Less than high school",
+          "codes": [
+            0,
+            1,
+            2
+          ]
+        },
+        {
+          "id": "high_school",
+          "label": "High school or GED",
+          "codes": [
+            3,
+            4
+          ]
+        },
+        {
+          "id": "some_college",
+          "label": "Some college or associate degree",
+          "codes": [
+            5,
+            6,
+            7
+          ]
+        },
+        {
+          "id": "bachelors_plus",
+          "label": "Bachelor's degree or higher",
+          "codes": [
+            8,
+            9,
+            10
+          ]
+        }
+      ]
+    },
+    "race": {
+      "variable": "HISPALLP_A",
+      "missing": [
+        97,
+        98,
+        99
+      ],
+      "codebook_page": 25,
+      "categories": [
+        {
+          "id": "hispanic",
+          "label": "Hispanic, any race",
+          "codes": [
+            1
+          ]
+        },
+        {
+          "id": "nh_white",
+          "label": "Non-Hispanic White only",
+          "codes": [
+            2
+          ]
+        },
+        {
+          "id": "nh_black",
+          "label": "Non-Hispanic Black only",
+          "codes": [
+            3
+          ]
+        },
+        {
+          "id": "nh_asian",
+          "label": "Non-Hispanic Asian only",
+          "codes": [
+            4
+          ]
+        },
+        {
+          "id": "nh_other",
+          "label": "Non-Hispanic other or multiple race",
+          "codes": [
+            5,
+            6,
+            7
+          ]
+        }
+      ]
+    },
+    "sex": {
+      "variable": "SEX_A",
+      "missing": [
+        7,
+        8,
+        9
+      ],
+      "codebook_page": 19,
+      "categories": [
+        {
+          "id": "male",
+          "label": "Male",
+          "codes": [
+            1
+          ]
+        },
+        {
+          "id": "female",
+          "label": "Female",
+          "codes": [
+            2
+          ]
+        }
+      ]
+    },
+    "age": {
+      "variable": "AGEP_A",
+      "missing": [
+        97,
+        98,
+        99
+      ],
+      "codebook_page": 21,
+      "categories": [
+        {
+          "id": "25_34",
+          "label": "25–34 years",
+          "minimum": 25,
+          "maximum": 34
+        },
+        {
+          "id": "35_44",
+          "label": "35–44 years",
+          "minimum": 35,
+          "maximum": 44
+        },
+        {
+          "id": "45_54",
+          "label": "45–54 years",
+          "minimum": 45,
+          "maximum": 54
+        },
+        {
+          "id": "55_64",
+          "label": "55–64 years",
+          "minimum": 55,
+          "maximum": 64
+        }
+      ]
+    },
+    "income": {
+      "variable": "RATCAT_A",
+      "source": "all 10 adultinc imputations",
+      "missing": [],
+      "categories": [
+        {
+          "id": "below_100",
+          "label": "Below 100% of poverty threshold",
+          "codes": [
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "id": "100_199",
+          "label": "100–199% of poverty threshold",
+          "codes": [
+            4,
+            5,
+            6,
+            7
+          ]
+        },
+        {
+          "id": "200_399",
+          "label": "200–399% of poverty threshold",
+          "codes": [
+            8,
+            9,
+            10,
+            11
+          ]
+        },
+        {
+          "id": "400_plus",
+          "label": "400% of poverty threshold or above",
+          "codes": [
+            12,
+            13,
+            14
+          ]
+        }
+      ]
+    }
+  },
+  "reliability": {
+    "minimum_unweighted_denominator": 100,
+    "minimum_events": 10,
+    "minimum_non_events": 10,
+    "minimum_design_df": 8,
+    "minimum_effective_n": 30,
+    "maximum_relative_standard_error": 0.3,
+    "maximum_absolute_ci_width": 0.3,
+    "policy_note": "Conservative application reliability gates; not a complete implementation or certification of NCHS data presentation standards. Suppressed cells return null estimates and intervals."
+  },
+  "regression": {
+    "full_formula": "fair_poor ~ education + age + sex + race + income",
+    "reduced_formula": "fair_poor ~ education + age + sex + race",
+    "age_function": "Categorical: 25–34, 35–44, 45–54, 55–64 years",
+    "references": {
+      "education": "bachelors_plus",
+      "sex": "female",
+      "race": "nh_white",
+      "income": "400_plus",
+      "age": "25_34"
+    }
+  },
+  "method_sources": [
+    "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Dataset_Documentation/NHIS/2024/srvydesc-508.pdf",
+    "https://r-survey.r-forge.r-project.org/pkgdown/docs/reference/svydesign.html",
+    "https://r-survey.r-forge.r-project.org/pkgdown/docs/reference/svyciprop.html",
+    "https://r-survey.r-forge.r-project.org/pkgdown/docs/reference/svyglm.html"
+  ],
+  "confidence_intervals": {
+    "level": 0.95,
+    "proportions": "Design-based t-Wald interval: svymean plus/minus t critical value times Taylor standard error; cell-domain degrees of freedom",
+    "multiply_imputed": "Rubin pooled mean and total variance; finite complete-data cell-domain df with Barnard-Rubin adjusted t df",
+    "invalid_bounds_policy": "Suppress; never silently clip intervals to [0,1]",
+    "regression": "Pool log-odds and covariance matrices; t confidence limits transformed to odds-ratio scale"
+  },
+  "validation": {
+    "external_reference_required_for_verified_label": true,
+    "production_runtime_executed_in_build_environment": false,
+    "independent_stata_reference_executed": false,
+    "absolute_tolerance": {
+      "estimate": 1e-06,
+      "se": 1e-06,
+      "ci_low": 1e-05,
+      "ci_high": 1e-05
+    },
+    "note": "Tolerances are preregistered acceptance thresholds, not evidence of agreement. No numerical R/Stata parity has been verified."
+  }
+}
