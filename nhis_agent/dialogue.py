@@ -22,6 +22,8 @@ preferences present in this conversation, explain general concepts, help with
 writing, discuss everyday topics, and answer ordinary arithmetic. Do not turn
 ordinary greetings or questions into an NHIS menu. Do not claim memories absent
 from the supplied conversation. Use relevant history naturally.
+When research_context.reply_language is zh or en, honor that saved reply-language
+preference. It applies to ordinary conversation as well as research replies.
 Keep ordinary replies brief and conversational by default. Answer the actual question
 directly; avoid repeating an introduction, a capabilities menu, or a methods lecture.
 Give fuller explanations when the user asks for them.
@@ -50,6 +52,11 @@ Return exactly one JSON object with mode and reply. The mode must be one of:
   Set reply to an empty string. A separate service will supply the actual evidence.
   "Explain black holes" is chat, not explanation. A generic concept such as
   confidence intervals outside an NHIS/current-result discussion may be chat.
+- dataset: the user asks about this application's underlying dataset, such as
+  its number of records, survey year, collection period, source, or freshness.
+  Set reply to an empty string. A separate service reads verified file metadata;
+  do not reuse the last result's sample size or invent metadata. A question about
+  a particular analysis's valid denominator remains explanation.
 
 research_context contains only registered scope and whether a published result
 exists. It contains no survey estimates. Never invent or infer NHIS proportions,
@@ -69,7 +76,7 @@ Do not claim any such action or an API/model connection test was performed.
 SCHEMA = {
     'type':'object',
     'properties':{
-        'mode':{'type':'string','enum':['chat','analysis','explanation']},
+        'mode':{'type':'string','enum':['chat','analysis','explanation','dataset']},
         'reply':{'type':'string'},
     },
     'required':['mode','reply'],
@@ -143,7 +150,10 @@ def _research_context(value):
                       and all(isinstance(item,str) and item in allowed for item in values)):
                     selected[key] = list(dict.fromkeys(values))
             clean['filters'] = selected
-    return {'spec':clean or None,'has_published_result':value.get('has_published_result') is True}
+    result={'spec':clean or None,'has_published_result':value.get('has_published_result') is True}
+    if value.get('reply_language') in ('en','zh'):
+        result['reply_language']=value['reply_language']
+    return result
 
 
 def _document(content):
@@ -160,7 +170,7 @@ def _document(content):
         raise ValueError('Invalid dialogue document')
     parsed = json.loads(content,object_pairs_hook=pairs,parse_constant=constant)
     if (not isinstance(parsed,dict) or set(parsed) != {'mode','reply'}
-            or parsed['mode'] not in ('chat','analysis','explanation')
+            or parsed['mode'] not in ('chat','analysis','explanation','dataset')
             or not isinstance(parsed['reply'],str) or len(parsed['reply']) > MAX_REPLY_CHARS):
         raise ValueError('Invalid dialogue schema')
     if parsed['mode'] == 'chat' and not parsed['reply'].strip():

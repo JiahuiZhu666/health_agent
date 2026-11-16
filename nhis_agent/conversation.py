@@ -26,6 +26,9 @@ from .outcomes import get_outcome, allowed_outcomes
 from .intent import inspect_intent
 from .execution_context import current as current_execution
 from .storage_policy import StoragePolicy, ConversationIndex
+from . import data
+from .presentation import (select_language, language_followup, dataset_topic, dataset_answer,
+                           analysis_answer, outcome_label, category_label, paired_care_answer, explanation_answer)
 
 _CONVERSATION_ID = re.compile(r'[a-f0-9]{32}')
 _RUN_ID = re.compile(r'[0-9]{8}T[0-9]{6}Z-[a-f0-9]{10}')
@@ -191,6 +194,8 @@ def _uses_research_flow(text, context):
     """Reserve fixed survey routing for research requests, not all conversation."""
     q = text.lower().strip()
     healthcare = requested_outcomes(q)
+    if healthcare and re.search(r'哪些年龄组|哪个年龄组|\bwhich age groups?\b|更常|more (?:often|likely)',q):
+        return True
     if healthcare and not re.search(r'premium|deductible|copay|coinsurance|保费|免赔|赔付|共付',q) and re.search(r'how.{0,45}(?:calculat|estimat)|怎么算|如何计算|计算步骤|计算方法',q):
         return True
     if healthcare and re.search(r'\b(?:compare|calculate|estimate|distribution|distributed|proportions?|prevalence|percentages?|rates?|show|analy[sz]e)\b|'
@@ -214,6 +219,8 @@ def _uses_research_flow(text, context):
         return True
     active = bool(context.get('spec') and context.get('last_turn_mode') != 'chat')
     if active:
+        if re.search(r'解释.{0,20}(?:指标|结果|计算)|(?:指标|结果).{0,20}(?:怎么算|计算|解释)',q):
+            return True
         followup = re.fullmatch(
             r'(?:what about|and|now|only|just|switch(?: to)?|change(?: to)?|restrict(?: to)?|'
             r'remove|clear|(?:go )?back to)\s+(?:the\s+)?'
@@ -564,7 +571,11 @@ class ConversationService:
         status = result.get('status', 'blocked')
         matching_previous = (current if current and current.get('status')=='ok' and
                              current.get('spec',{}).get('outcome','fair_poor') == spec.get('outcome','fair_poor') else None)
-        answer = analysis_reply(result,spec,previous=matching_previous,question=question)
+        language=select_language('',context)
+        if status=='clarify' and result.get('answer'):
+            answer=result['answer']
+        else:
+            answer = analysis_answer(result,spec,question=question,language=language)
         source = result.get('run_id')
         if not isinstance(source,str) or not _RUN_ID.fullmatch(source):
             source = None
@@ -582,7 +593,9 @@ class ConversationService:
     def _execute_outcomes(self, outcomes, base, text, conversation, current, emit):
         """Compare verified events, retaining each event's denominator and source."""
         completed, identifiers, sections = [], [], []
-        summary = ['| Indicator | Valid n | Weighted share | 95% CI |', '|---|---:|---:|---|']
+        language=select_language('',conversation.setdefault('context',{}))
+        summary = ['| 指标 | 有效样本量 | 加权比例 | 95% 置信区间 |' if language=='zh' else
+                   '| Indicator | Valid n | Weighted share | 95% CI |', '|---|---:|---:|---|']
         for outcome_id in outcomes:
             spec = _validated(dict(base,outcome=outcome_id))
             item, draft, status, identifier = self._execute_analysis(spec,text,conversation,current,emit)
@@ -595,25 +608,46 @@ class ConversationService:
                     if rows:
                         row = rows[0]
                         summary.append('| {} | {:,} | {:.2f}% | {:.2f}%–{:.2f}% |'.format(
-                            get_outcome(outcome_id)['label'],int(row['n']),100*row['estimate'],100*row['ci_low'],100*row['ci_high']))
+                            outcome_label(outcome_id,language),int(row['n']),100*row['estimate'],100*row['ci_low'],100*row['ci_high']))
                 else:
-                    sections.append('### '+get_outcome(outcome_id)['label']+'\n\n'+draft)
+                    sections.append('### '+outcome_label(outcome_id,language)+'\n\n'+draft)
             else:
-                sections.append('### '+get_outcome(outcome_id)['label']+'\n\n'+draft)
-        intro = ('Here is the distribution of these medical-service measures for NHIS 2024 adults aged 25–64. '
-                 'Insurance is measured at the time of interview; delayed and unmet care refer specifically to cost barriers in the past 12 months.')
+                sections.append('### '+outcome_label(outcome_id,language)+'\n\n'+draft)
+        insurance=any(code in ('insured','uninsured') for code in outcomes)
+        intro = ('分别比较了 NHIS 2024 年 25–64 岁成年人中这些医疗服务指标。' if language=='zh' else
+                 'Here are the requested medical-service comparisons for NHIS 2024 adults aged 25–64.')
+        if insurance:
+            intro+=(' 医保反映访谈时的参保状态；费用相关就医障碍反映过去 12 个月。' if language=='zh' else
+                    ' Insurance is measured at the time of interview; cost-related barriers refer to the past 12 months.')
+        else:
+            intro+=(' 延迟就医和未获得所需医疗服务分别统计，均限定为过去 12 个月因费用造成的情况。' if language=='zh' else
+                    ' Delayed and unmet care are separate measures of cost barriers during the past 12 months.')
         if base.get('filters'):
-            intro += ' The population is restricted to ' + _scope_label(base)
+            if language=='zh':
+                intro+=' 当前筛选：'+'；'.join('、'.join(category_label(item,'zh') for item in (values if isinstance(values,list) else [values])) for values in base['filters'].values())+'。'
+            else:
+                intro += ' The population is restricted to ' + _scope_label(base)
         if len(summary)>2:
             sections.insert(0,'\n'.join(summary))
-        tail = ('Each estimate uses its own valid-response denominator and the complex survey weights, strata, and sampling units. '
-                'Missing responses are excluded. The cost-barrier questions do not measure every reason for delay, '
-                'and a “No” response does not establish that all needed care was timely. '
-                'The coverage and cost-barrier percentages use different time frames and are not a single mutually exclusive distribution.')
+        tail = ('各指标使用各自的有效回答作为分母，并采用复杂抽样权重；缺失回答不计为“没有费用障碍”。'
+                '同一个人可能同时报告延迟和未获得服务，因此不能把两项比例相加，也不能据此判断所有就医是否及时。' if language=='zh' else
+                'Each measure uses its own valid-response denominator and complex survey weights. Missing responses are excluded. '
+                'A person can report both delayed and unmet care, so these percentages cannot be added. A “No” response does not establish that all needed care was timely.')
+        if insurance:
+            tail+=(' 医保覆盖与就医障碍的时间口径不同，不能合并为互斥分布。' if language=='zh' else
+                   ' Coverage and cost barriers have different time frames and do not form a single mutually exclusive distribution.')
+        if completed and len(completed)<len(outcomes):
+            intro=('本次只完成了部分指标；未完成项的具体原因列在下方。 ' if language=='zh' else
+                   'Only part of this request completed; the notices below identify the unavailable measures. ')+intro
         if completed:
             conversation['context']['active_outcomes'] = list(outcomes)
+            if len(completed)==len(outcomes):
+                paired=paired_care_answer(completed,question=text,language=language)
+                if paired is not None:
+                    return paired,'ok',make_charts(completed),identifiers
         else:
-            intro = 'These medical-service indicators could not be released from the current data. The notices below explain what is missing.'
+            intro = ('本次没有可发布的医疗服务估计，具体原因如下。' if language=='zh' else
+                     'These medical-service indicators could not be released from the current data. The notices below explain what is missing.')
         return '\n\n'.join([intro]+sections+[tail]), ('ok' if completed else 'blocked'), make_charts(completed), identifiers
 
     @staticmethod
@@ -919,6 +953,30 @@ class ConversationService:
             result = None
             source_run_id = None
             context = conversation.setdefault('context', {})
+            if context.get('response_language') not in ('en','zh'):
+                # Older chats can contain an explicit preference without the
+                # newly persisted field. Recover it from this chat's own turns.
+                for prior in conversation['messages'][:-1]:
+                    if prior.get('role')=='user' and language_followup(prior.get('content','')):
+                        select_language(prior['content'],context)
+            language=select_language(text,context)
+            language_only=language_followup(text)
+            target_question=text
+            target_message=None
+            if language_only:
+                history=conversation['messages'][:-1]
+                for index in range(len(history)-1,-1,-1):
+                    item=history[index]
+                    if item.get('role')=='user' and not language_followup(item.get('content','')):
+                        target_question=item.get('content','')
+                        target_message=next((reply for reply in history[index+1:] if reply.get('role')=='assistant'),None)
+                        break
+            metadata_request=dataset_topic(target_question)
+            replay_ids=[]
+            if language_only and target_message and target_message.get('kind') in ('analysis','explanation','method'):
+                replay_ids=list(target_message.get('run_ids') or [])
+                if target_message.get('run_id'):replay_ids.append(target_message['run_id'])
+                replay_ids=list(dict.fromkeys(replay_ids))
             current = self._run(context.get('last_attempt_run_id') or conversation.get('last_run_id'))
             previous = self._run(context.get('previous_run_id'))
             decision = None
@@ -938,14 +996,15 @@ class ConversationService:
             chat_reference_clarification = False
             initial_generation = None
             planner = getattr(self.agent, 'decide_reply', None)
-            if callable(planner) and '[credential hidden]' not in text and not plot_request and not batch_requested and not outcome_codes and (conversation_only or not _uses_research_flow(text, context)):
+            if callable(planner) and not metadata_request and not language_only and '[credential hidden]' not in text and not plot_request and not batch_requested and not outcome_codes and (conversation_only or not _uses_research_flow(text, context)):
                 emit({'stage':'conversation','label':'Understand the conversation','status':'running',
                       'detail':'Use this conversation’s recent messages to distinguish chat from survey work.'})
                 try:
                     ordinary_reference = _chat_reference(text, context)
                     decision = planner(text, conversation['messages'][:-1],
                                        {'spec':None if ordinary_reference else context.get('spec'),
-                                        'has_published_result':False if ordinary_reference else bool(current and current.get('status')=='ok')})
+                                        'has_published_result':False if ordinary_reference else bool(current and current.get('status')=='ok'),
+                                        'reply_language':language})
                 except Exception:
                     decision = {'status':'failed','error_code':'dialogue_service_error',
                                 'message':'The conversation service could not complete this reply.'}
@@ -958,6 +1017,8 @@ class ConversationService:
                     initial_generation = {'status':'local', 'message':'Clarify the conversational reference without reusing old survey evidence.'}
                 if decision.get('status')=='ok' and decision.get('mode')=='analysis' and not conversation_only:
                     outcome_codes = list(routed.get('outcomes') or outcome_codes)
+                if decision.get('status')=='ok' and decision.get('mode')=='dataset':
+                    metadata_request=True
                 emit({'stage':'conversation','label':'Conversation request understood',
                       'status':'complete' if decision.get('status')=='ok' else 'failed',
                       'detail':'No survey calculation or blind measurement was performed in this step.',
@@ -977,6 +1038,44 @@ class ConversationService:
             if '[credential hidden]' in text:
                 answer, status, kind = 'Please do not send credentials in chat. They have been hidden and were not sent to the model.', 'blocked', 'settings'
                 emit({'stage':'scope','label':'Protect credentials','status':'blocked','detail':'Connection credentials are managed on the server.'})
+            elif metadata_request and not (routed.get('status')=='blocked' and _rule_override(text)):
+                metadata=data.status(getattr(self.agent,'data_root',self.root))
+                answer=dataset_answer(metadata,language)
+                status='ok' if metadata.get('ready') else 'blocked'
+                source_only=(_method_topic(target_question)=='source' and not re.search(
+                    r'多少|几条|几行|什么时候|啥时候|哪年|年份|how many|rows?|records?|when|year',target_question,re.I))
+                if source_only:
+                    answer=('数据来自美国 CDC／NCHS 的 National Health Interview Survey（NHIS）成人公开数据。'
+                            if language=='zh' else 'The data source is the CDC/NCHS National Health Interview Survey (NHIS) Sample Adult public-use release. ')
+                    answer+='[官方数据说明]('+data.SOURCE_PAGE+')' if language=='zh' else '[Official data documentation]('+data.SOURCE_PAGE+')'
+                    status='ok'
+                kind='method' if source_only else 'dataset'
+                initial_generation={'status':'local','message':'Answered from verified dataset metadata, without reusing statistical results or calling a model.'}
+                emit({'stage':'data','label':'Read verified dataset metadata','status':'complete' if status=='ok' else 'blocked',
+                      'detail':'Read the survey release year and verified file record counts; no statistical calculation was started.',
+                      'facts':{'row_count':metadata.get('row_count') if metadata.get('ready') else None,
+                               'year':metadata.get('year'),'reused_result':False}})
+            elif language_only:
+                saved=[self._run(identifier) for identifier in replay_ids]
+                saved=[item for item in saved if item and item.get('status')=='ok']
+                if saved:
+                    parts=[]
+                    for item in saved:
+                        localized=explanation_answer(item,item.get('spec',{}),target_question,language) if target_message.get('kind')=='explanation' else None
+                        parts.append(localized or analysis_answer(item,item.get('spec',{}),question=target_question,language=language))
+                    answer='\n\n'.join(parts)
+                    referenced_runs=[item['run_id'] for item in saved]
+                    charts=make_charts(saved) if len(saved)>1 else []
+                    status,kind='ok','explanation'
+                    if len(saved)==1:
+                        result=saved[0];source_run_id=result['run_id'];referenced_runs=[]
+                else:
+                    answer=('好的，接下来会用中文回答。' if language=='zh' else 'I’ll answer in English from here on.')
+                    status,kind='ok','language'
+                initial_generation={'status':'local','message':'Changed the reply language; saved evidence was reused without new statistical or model-measurement calls.'}
+                emit({'stage':'explain','label':'Apply reply language','status':'complete',
+                      'detail':'Preserve the requested language and reuse only the referenced published evidence.',
+                      'facts':{'reused_result':bool(saved),'language':language}})
             elif chat_turn:
                 kind = 'chat'
                 if chat_reference_clarification:
@@ -1124,10 +1223,16 @@ class ConversationService:
                     if previous and current and previous.get('spec',{}).get('outcome','fair_poor') != current.get('spec',{}).get('outcome','fair_poor'):
                         previous = None
                 last_assistant = next((item for item in reversed(conversation['messages'][:-1]) if item.get('role')=='assistant'), {})
+                plural_reference=bool(re.search(r'\b(?:these|all|charts?|plots?|graphs?|two (?:indicators|measures))\b|这些|所有|全部|这几|这两|两个指标',text.lower()))
+                if plural_reference and not last_assistant.get('charts'):
+                    last_assistant=next((item for item in reversed(conversation['messages'][:-1]) if item.get('role')=='assistant' and
+                        (len(item.get('charts',[]))>1 or len(item.get('run_ids',[]))>1)),last_assistant)
                 chart_sources = list(dict.fromkeys(item.get('source_run_id') for item in last_assistant.get('charts',[]) if isinstance(item,dict)))
+                if not chart_sources and plural_reference:
+                    chart_sources=list(last_assistant.get('run_ids') or [])
                 if explicit_outcomes:
                     chart_sources = [identifier for identifier in chart_sources if (self._run(identifier) or {}).get('spec',{}).get('outcome','fair_poor') in explicit_outcomes]
-                explain_multiple = (len(chart_sources)>1 and re.search(r'\b(?:these|all|charts?|plots?|graphs?)\b|这些|所有|全部|这几',text.lower())
+                explain_multiple = (len(chart_sources)>1 and plural_reference
                                     and not (routed.get('spec') or {}).get('filters')
                                     and not any(re.search(pattern,text.lower()) for pattern in _GROUP_PATTERNS.values()))
                 incompatible = _explanation_target_mismatch(text, current)
@@ -1147,18 +1252,22 @@ class ConversationService:
                     answer, kind = (descriptor['definition'] + ' ' + descriptor['limitation'] +
                                     ' There is no matching published estimate for that request in this conversation yet.'), ('method' if defining else 'clarification')
                 elif explain_multiple:
-                    parts = ['Here is how to read the charts together. Each panel keeps its own grouping and population.']
+                    parts = ['下面分别解释这两项指标的计算口径，沿用已保存的结果，没有重新计算。' if language=='zh' else
+                             'Here is how to read these measures together. Each keeps its own source, grouping, and population.']
                     for identifier in chart_sources:
                         item = self._run(identifier)
                         if item and item.get('status') == 'ok':
-                            interpretation, _ = self._explain(text,item,None)
-                            parts.append('### ' + _scope_label(item.get('spec') or {}) + '\n\n' + interpretation)
+                            interpretation = explanation_answer(item,item.get('spec',{}),text,'zh') if language=='zh' else self._explain(text,item,None)[0]
+                            heading=outcome_label(item.get('spec',{}).get('outcome','fair_poor'),language) if language=='zh' else _scope_label(item.get('spec') or {})
+                            parts.append('### ' + heading + '\n\n' + interpretation)
                             referenced_runs.append(identifier)
                     answer, kind = '\n\n'.join(parts), 'explanation'
                 elif incompatible:
                     answer, kind = 'This explanation refers to a different population, grouping, or analysis from the saved result. Run the requested analysis first, such as an income gradient or a male-only comparison, so I can explain the matching evidence.', 'clarification'
                 else:
                     answer, kind = self._explain(text,current,previous)
+                if language=='zh' and kind!='clarification' and current and current.get('status')=='ok' and not explain_multiple:
+                    answer=explanation_answer(current,current.get('spec',{}),text,language) or analysis_answer(current,current.get('spec',{}),question=text,language=language)
                 status = 'clarify' if kind == 'clarification' else 'ok'
                 source_run_id = current.get('run_id') if current and not explain_multiple else None
                 if source_run_id:
@@ -1216,7 +1325,7 @@ class ConversationService:
             if conversation['title'] in ('New chat', '\u65b0\u5bf9\u8bdd') and not greeting and not help_question:
                 conversation['title'] = text[:32] + ('…' if len(text)>32 else '')
             generation = initial_generation or {'status':'local', 'message':'This is a registered-scope or connection notice.'}
-            if status == 'ok' and kind in ('analysis','explanation','method','greeting','help','acknowledgment'):
+            if status == 'ok' and not language_only and not metadata_request and kind in ('analysis','explanation','method','greeting','help','acknowledgment'):
                 compose = getattr(self.agent, 'compose_reply', None)
                 if callable(compose):
                     emit({'stage':'reply_api','label':'Prepare the research explanation','status':'running',
@@ -1238,8 +1347,12 @@ class ConversationService:
                         if generation['status'] == 'ok':
                             generation.update(status='failed', error_code='empty_answer')
                         configured = generated.get('status') != 'not_configured'
-                        note = ('**The model reply was not completed. The verified statistical output is shown below.**' if configured else
-                                '**The conversation service is not connected. The verified statistical output is shown below.**')
+                        if language=='zh':
+                            note=('**模型润色未完成，以下保留已验证的统计结果。**' if configured else
+                                  '**模型服务尚未连接，以下为已验证的统计结果。**')
+                        else:
+                            note = ('**The model reply was not completed. The verified statistical output is shown below.**' if configured else
+                                    '**The conversation service is not connected. The verified statistical output is shown below.**')
                         answer = note + '\n\n' + str(answer)
                         emit({'stage':'reply_api','label':'No model explanation was published',
                               'status':'failed' if configured else 'skipped',
@@ -1264,6 +1377,8 @@ class ConversationService:
                 message['source'] = {'type':'run','run_id':source_run_id}
             else:
                 message['source'] = {'type':'registered_method' if kind in ('method','help','greeting') else 'conversation'}
+            if kind=='dataset' or (kind=='method' and metadata_request):
+                message['source']={'type':'dataset','year':metadata.get('year'),'url':data.SOURCE_PAGE}
             conversation['messages'].append(message)
             if kind == 'chat':
                 context['last_turn_mode'] = 'chat'

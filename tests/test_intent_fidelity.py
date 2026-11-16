@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from nhis_agent.spec import route
+from nhis_agent.spec import route, requested_outcomes
 from nhis_agent.intent import inspect_intent, coverage_check, AnalysisPatch, ExecutionPlan, FILTER_VALUES
 from nhis_agent.conversation import ConversationService
 from nhis_agent.engine import Agent
@@ -15,6 +15,74 @@ from test_conversation import FakeAgent
 
 
 class IntentFidelityTests(unittest.TestCase):
+    def test_shared_cost_barrier_questions_cover_both_batch_members_and_the_explicit_age_group(self):
+        for text in (
+            '哪些年龄组更常因费用而延迟或未获得医疗服务？',
+            '哪个年龄组因为费用而推迟或未能就医？',
+            '哪些年龄群体因费用延迟就医或未就医？',
+            'Compare cost-related delayed and unmet medical care by age group',
+            'Which age groups have more cost-related delayed or unmet care?',
+            'Which age groups more often delay or fail to obtain medical care because of cost?',
+        ):
+            with self.subTest(question=text):
+                intent=inspect_intent(text)
+                result=route(text)
+                self.assertEqual(result['status'],'ready',result)
+                self.assertEqual(result['spec']['group_by'],'age')
+                expected={'delayed_care_cost','unmet_care_cost'}
+                self.assertEqual(set(requested_outcomes(text)),expected)
+                recognized={code for item in intent.recognized_constraints if item.field=='outcome'
+                            for code in item.value.split(',')}
+                self.assertEqual(recognized,expected)
+                self.assertIn('age',{item.value for item in intent.recognized_constraints
+                                     if item.field=='group_by'})
+                for outcome in expected:
+                    self.assertIsNone(coverage_check(intent,dict(result['spec'],outcome=outcome)))
+                self.assertIsNotNone(coverage_check(intent,dict(result['spec'],outcome='fair_poor')))
+                self.assertIsNotNone(coverage_check(intent,dict(result['spec'],group_by='education')))
+                for item in intent.recognized_constraints:
+                    self.assertEqual(text[item.start:item.end],item.text)
+
+    def test_exact_reported_question_reaches_only_its_matching_typed_batch_members(self):
+        text='哪些年龄组更常因费用而延迟或未获得医疗服务？'
+        base=route(text)['spec']
+        with TemporaryDirectory() as folder,patch.dict(os.environ,{},clear=True):
+            agent=Agent(folder)
+            with patch.object(agent,'_execute_spec',return_value={'status':'ok','test_only':True}) as execute, \
+                 patch('nhis_agent.engine.stats.analyze') as statistics, \
+                 patch('nhis_agent.engine.models.measure') as measure:
+                for outcome in ('delayed_care_cost','unmet_care_cost'):
+                    self.assertEqual(agent.analyze_spec(dict(base,outcome=outcome),text)['status'],'ok')
+                self.assertEqual(execute.call_count,2)
+                for wrong in (dict(base,outcome='fair_poor'),dict(base,group_by='income')):
+                    self.assertEqual(agent.analyze_spec(wrong,text,measure_model=True)['status'],'clarify')
+                self.assertEqual(execute.call_count,2)
+                statistics.assert_not_called()
+                measure.assert_not_called()
+
+    def test_single_cost_event_cannot_pass_coverage_for_the_other_event(self):
+        for text,selected,other in (
+            ('Compare delayed care by age group','delayed_care_cost','unmet_care_cost'),
+            ('Compare unmet medical care by age group','unmet_care_cost','delayed_care_cost'),
+            ('按年龄组比较延迟就医比例','delayed_care_cost','unmet_care_cost'),
+            ('按年龄组比较未就医比例','unmet_care_cost','delayed_care_cost'),
+            ('Compare insured proportions by education','insured','uninsured'),
+            ('Compare uninsured proportions by education','uninsured','insured'),
+        ):
+            with self.subTest(question=text):
+                result=route(text)
+                self.assertEqual(result['status'],'ready',result)
+                self.assertEqual(requested_outcomes(text),[selected])
+                self.assertIsNone(coverage_check(inspect_intent(text),dict(result['spec'],outcome=selected)))
+                self.assertIsNotNone(coverage_check(inspect_intent(text),dict(result['spec'],outcome=other)))
+
+    def test_cost_reason_is_not_a_causal_effect_request(self):
+        self.assertEqual(route('Which age groups delay medical care because of cost?')['status'],'ready')
+        for text in ('Does education cause poor self-rated health?',
+                     'Estimate the causal effect of income on self-rated health'):
+            with self.subTest(question=text):
+                self.assertEqual(route(text)['status'],'blocked')
+
     def test_unknown_explicit_chinese_group_and_unqualified_blood_glucose_are_unresolved(self):
         for text in ('按宗教比较自评健康', '按教育和宗教比较自评健康',
                      'Compare blood glucose by education'):

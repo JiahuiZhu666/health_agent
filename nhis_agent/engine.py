@@ -299,7 +299,10 @@ class Agent:
             return {'status':'not_configured', 'content':None, 'error_code':'missing_configuration',
                     'message':'The server has not configured a model connection.'}
         try:
-            payload = grounding.prepare(question, draft)
+            # The local renderer chooses the response language. An untrusted
+            # question cannot change the immutable evidence editor's locale.
+            language = 'zh' if isinstance(draft,str) and re.search(r'[\u3400-\u4dbf\u4e00-\u9fff]',draft) else 'en'
+            payload = grounding.prepare(question, draft, language=language)
         except (ValueError, TypeError):
             return {'status':'failed','content':None,'error_code':'evidence_preparation_failed',
                     'message':'Reply evidence could not be prepared. No API request was sent.'}
@@ -444,7 +447,7 @@ class Agent:
         trace.emit('data', 'running', 'Verify the CDC download record, CSV integrity, and survey design fields without transmitting individual records.')
         dataset = data.status(self.data_root)
         source_hashes={name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in
-                       ('config/registry.json','scripts/analyze.R','nhis_agent/stats.py','nhis_agent/spec.py','nhis_agent/intent.py',
+                       ('config/registry.json','scripts/analyze.R','nhis_agent/stats.py','nhis_agent/spec.py','nhis_agent/intent.py','nhis_agent/outcome_intent.py',
                         'nhis_agent/engine.py','nhis_agent/r_worker.py','nhis_agent/models.py','nhis_agent/transport.py')}
         configuration={key:model_config.get(key) for key in ('provider','base_url','model')}
         runtime=self._statistics_health.snapshot(wait=True) if dataset.get('ready') else {}

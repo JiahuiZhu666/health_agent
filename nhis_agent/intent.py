@@ -138,11 +138,6 @@ def coverage_check(intent, spec):
     explicit = intent.recognized_constraints
     outcomes = {code for item in explicit if item.field == 'outcome'
                 for code in item.value.split(',') if code}
-    specific_insurance = {item.value for item in explicit
-                          if item.field == 'outcome' and item.value in ('insured', 'uninsured')}
-    if specific_insurance:
-        outcomes.difference_update(('insured', 'uninsured'))
-        outcomes.update(specific_insurance)
     if outcomes and spec.get('outcome', 'fair_poor') not in outcomes:
         return ('The analysis specification does not match the indicator explicitly requested. '
                 'Please confirm the intended indicator before any statistics or model measurement are run.')
@@ -290,19 +285,14 @@ def inspect_intent(question):
     for match in re.finditer(r'(?<!\d)((?:19|20)\d{2})(?!\d)',q):
         record(recognized if match.group(1)=='2024' else unsupported,'year',match,
                '' if match.group(1)=='2024' else 'Only the verified 2024 survey release is supported.',match.group(1))
-    for code,pattern in (
-        ('fair_poor',r'self.?rated health|fair\s*(?:/|or)\s*poor(?: health)?|自评健康|健康一般或较差'),
-        ('insured,uninsured',r'(?:health )?insurance coverage|health insurance|医疗保险|健康保险|医保|notcov_a'),
-        ('insured',r'\binsured\b|有医保|已参保'),
-        ('uninsured',r'\buninsured\b|without (?:health )?insurance|not covered|无医保|无保险|未参保'),
-        ('delayed_care_cost',r'delayed? (?:medical )?care|延迟就医|推迟就医|meddl12m_a'),
-        ('unmet_care_cost',r'unmet (?:medical )?care|未获得.{0,6}医疗|未就医|medng12m_a')):
-        for match in re.finditer(pattern,q):record(recognized,'outcome',match,value=code)
+    from .outcome_intent import outcome_mentions
+    for mention in outcome_mentions(question):
+        recognized.append(Constraint('outcome',mention.text,mention.start,mention.end,','.join(mention.outcomes)))
     for code,pattern in (('education',r'\bby education\b|\bswitch to education\b|按教育'),
                          ('income',r'\bby income\b|\bswitch to income\b|按收入'),
                          ('sex',r'\bby sex\b|\bby gender\b|按性别'),
                          ('race',r'\bby race\b|\bby ethnicity\b|按族裔|按种族'),
-                         ('age',r'\bby age\b|按年龄组')):
+                         ('age',r'\bby age\b|\bwhich age groups?\b|按年龄组|哪些年龄组|哪个年龄组|年龄群体')):
         for match in re.finditer(pattern,q):record(recognized,'group_by',match,value=code)
     for match in re.finditer(r'(?:(\d{2}(?:\.\d+)?)\s*(?:%|percent)\s*(?:confidence|ci)|(?:confidence|\bci\b)\D{0,8}(\d{2}(?:\.\d+)?)\s*(?:%|percent))',q):
         value=match.group(1) or match.group(2)

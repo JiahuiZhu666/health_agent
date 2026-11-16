@@ -6,6 +6,31 @@
   },
   "baseline_commit": "caa58255f96323b1d943165609d64c5e217977d9",
   "baseline_tag": "upgrade-baseline-caa5825",
+  "conversation_quality_followup": {
+    "actual_nhis_age_outcomes": [
+      "delayed_care_cost",
+      "unmet_care_cost"
+    ],
+    "details": "conversation-quality-fix.md",
+    "existing_conversations_modified": false,
+    "live_provider_check": "not_run",
+    "local_receipt_sha256": "38f1e9c3f0020699c6b072605f7fb3ad824f8db07f04651eb8e1e4c4f2226a70",
+    "local_server_restart": "required_listener_permission_EPERM",
+    "metadata_source": "verified_dataset",
+    "python_passed": 558,
+    "python_skipped": 1,
+    "python_tests_run": 559,
+    "released_age_groups_per_outcome": 4,
+    "semantic_cases": 69,
+    "single_comparison_table": true,
+    "source_sha256": {
+      "nhis_agent/conversation.py": "228d09a1fb7e9b37ca968875666c8a0483990dae30204e2d30463fad5b0b4d97",
+      "nhis_agent/grounding.py": "04ea2607a70055c3ccd1df7297ace8391b9e7548c34bdffe0da61599063c1dcb",
+      "nhis_agent/outcome_intent.py": "0430e2335b63f274ed4dfc069ba51e36a36e96d2ecc921fbbdaa5be8b6066165",
+      "nhis_agent/presentation.py": "0c1759b0e3648aaaf3999483ce0a296143326ad3f00c546ddd0b1ac1ea281593"
+    },
+    "status": "passed"
+  },
   "execution_environment": {
     "python": "3.9.6",
     "system": "Darwin"

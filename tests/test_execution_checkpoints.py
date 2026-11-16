@@ -34,7 +34,7 @@ SPEC = {'year': 2024, 'outcome': 'fair_poor', 'analysis': 'proportion',
 RUNTIME = {'ready': True, 'r_version': 'fixture-R', 'survey_version': 'fixture-survey',
            'jsonlite_version': 'fixture-jsonlite', 'mitools_version': 'fixture-mitools'}
 SOURCES = ('config/registry.json', 'scripts/analyze.R', 'nhis_agent/stats.py',
-           'nhis_agent/spec.py', 'nhis_agent/intent.py', 'nhis_agent/engine.py',
+           'nhis_agent/spec.py', 'nhis_agent/intent.py', 'nhis_agent/outcome_intent.py', 'nhis_agent/engine.py',
            'nhis_agent/r_worker.py', 'nhis_agent/models.py', 'nhis_agent/transport.py')
 
 

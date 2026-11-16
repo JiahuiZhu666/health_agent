@@ -117,3 +117,5 @@ The following remain release gates:
 - Complete independent R/Stata variance/CI/MI comparisons and definition-compatible external NHIS benchmarking. They remain `pending` in research output.
 - Run a separate, explicit low-budget live-provider check and verify target-host proxy/TLS, memory/disk alerting, persistence and restore operations. No real provider request was sent for this upgrade.
 - Verify a successful Git push and target deployment. Local commits/configuration alone do not prove that GitHub or the online site changed. Required-status branch protection must also be enabled on GitHub; a workflow file alone does not enforce merge policy.
+
+The [latest conversation regression fix](conversation-quality-fix.md) adds shared outcome parsing, dataset metadata intent, persistent Chinese replies and compact paired age comparisons. Its current verification is recorded separately from the original upgrade baseline.

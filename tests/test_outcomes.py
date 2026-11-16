@@ -7,6 +7,53 @@ import unittest
 from unittest.mock import patch
 
 from nhis_agent import outcomes
+from nhis_agent.outcome_intent import outcome_mentions, selected_outcomes
+
+
+class CanonicalOutcomeIntentTests(unittest.TestCase):
+    def test_shared_medical_object_names_both_events_with_original_source_spans(self):
+        questions=(
+            '哪些年龄组更常因费用而延迟或未获得医疗服务？',
+            '按年龄组比较因费用而延迟或未获得医疗服务的比例',
+            '哪个年龄组因为费用而推迟或未能就医？',
+            'Compare cost-related delayed and unmet medical care by age group',
+            'Which age groups have more cost-related delayed or unmet care?',
+            'Which age groups more often delay or fail to obtain medical care because of cost?',
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                mentions=outcome_mentions(question)
+                self.assertEqual(selected_outcomes(question),('delayed_care_cost','unmet_care_cost'))
+                self.assertEqual({code for item in mentions for code in item.outcomes},
+                                 {'delayed_care_cost','unmet_care_cost'})
+                for item in mentions:
+                    self.assertEqual(question[item.start:item.end],item.text)
+                    self.assertLess(item.start,item.end)
+
+    def test_single_events_and_insurance_polarity_are_never_implicitly_swapped(self):
+        for question,expected in (
+            ('Compare delayed medical care by age group',('delayed_care_cost',)),
+            ('Compare unmet medical care by age group',('unmet_care_cost',)),
+            ('按年龄组比较费用导致的未就医',('unmet_care_cost',)),
+            ('Compare insured proportions by education',('insured',)),
+            ('Compare uninsured proportions by education',('uninsured',)),
+            ('Compare people without health insurance by age group',('uninsured',)),
+            ('Compare people not insured by age group',('uninsured',)),
+            ('按年龄组比较有医保比例',('insured',)),
+            ('按年龄组比较无医保比例',('uninsured',)),
+            ('Show health insurance coverage distribution',('insured','uninsured')),
+            ('Show whether adults are insured or uninsured',('insured','uninsured')),
+            ('按年龄组比较有无医保',('insured','uninsured')),
+        ):
+            with self.subTest(question=question):
+                self.assertEqual(selected_outcomes(question),expected)
+
+    def test_unknown_outcomes_and_nonmedical_insurance_do_not_become_health_events(self):
+        for question in ('Compare blood glucose by education',
+                         'Compare car insurance coverage by age group',
+                         'Compare religious affiliation by education'):
+            with self.subTest(question=question):
+                self.assertEqual(selected_outcomes(question),())
 
 
 class OutcomeMetadataTests(unittest.TestCase):

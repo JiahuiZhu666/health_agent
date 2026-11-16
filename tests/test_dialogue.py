@@ -39,6 +39,15 @@ class DialogueTests(unittest.TestCase):
         self.assertEqual(args.kwargs['schema'],dialogue.SCHEMA)
         self.assertEqual(args.kwargs['max_output_tokens'],3200)
 
+    def test_dataset_intent_never_publishes_model_generated_record_counts(self):
+        result,payload,args=self.call('How large is our survey file?',
+            generated=response('dataset','Invented record count 999999'))
+        self.assertEqual(result['status'],'ok')
+        self.assertEqual(result['mode'],'dataset')
+        self.assertEqual(result['reply'],'')
+        self.assertIn('dataset',args.kwargs['schema']['properties']['mode']['enum'])
+        self.assertNotIn('999999',str(result))
+
     def test_style_guidance_is_conversational_and_batch_requests_remain_analysis_intent(self):
         result,payload,args=self.call('Do all those comparisons.',
             context={'has_published_result':True,'spec':{'analysis':'proportion','group_by':'education'}},

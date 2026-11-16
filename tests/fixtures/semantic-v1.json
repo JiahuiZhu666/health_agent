@@ -21,7 +21,10 @@
       "id": "READY-ZH-EDUCATION",
       "question": "按教育比较自评健康",
       "ready": true,
-      "spec": {"group_by": "education", "outcome": "fair_poor"}
+      "spec": {
+        "group_by": "education",
+        "outcome": "fair_poor"
+      }
     },
     {
       "id": "INT-01",
@@ -420,6 +423,33 @@
       "id": "DOUBLE-NOT-ONLY",
       "question": "Compare fair/poor health by education not only women",
       "ready": false
+    },
+    {
+      "id": "LATEST-AGE-CARE-ZH",
+      "question": "哪些年龄组更常因费用而延迟或未获得医疗服务？",
+      "ready": true,
+      "spec": {
+        "outcome": "delayed_care_cost",
+        "group_by": "age"
+      }
+    },
+    {
+      "id": "LATEST-AGE-CARE-EN",
+      "question": "Compare cost-related delayed and unmet medical care by age group",
+      "ready": true,
+      "spec": {
+        "outcome": "delayed_care_cost",
+        "group_by": "age"
+      }
+    },
+    {
+      "id": "LATEST-AGE-UNMET-ONLY",
+      "question": "Compare unmet medical care because of cost by age",
+      "ready": true,
+      "spec": {
+        "outcome": "unmet_care_cost",
+        "group_by": "age"
+      }
     }
   ]
 }
