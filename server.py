@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Loopback-only web front end. No Python web packages are required."""
+"""Local or explicitly configured hosted chat. No web packages are required."""
 import argparse
 import base64
+from concurrent.futures import Future
 import hmac
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
@@ -10,6 +12,9 @@ import os
 from pathlib import Path
 import re
 import sys
+import threading
+import time
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 import webbrowser
 
@@ -34,7 +39,9 @@ def load_environment():
     if not path.exists():
         return
     allowed = {'OPENAI_API_KEY', 'MODEL_PROVIDER', 'MODEL_BASE_URL', 'MODEL_NAME', 'NHIS_MODEL_PROVIDER', 'NHIS_MODEL_BASE_URL', 'NHIS_MODEL_NAME',
-               'WEB_AUTH_SECRET','NHIS_STATE_DIR','NHIS_HOST','NHIS_ALLOWED_HOSTS','NHIS_ALLOWED_ORIGINS','PORT','NHIS_AUTO_DOWNLOAD_DATA'}
+               'WEB_AUTH_SECRET','NHIS_STATE_DIR','NHIS_HOST','NHIS_ALLOWED_HOSTS','NHIS_ALLOWED_ORIGINS','PORT','NHIS_AUTO_DOWNLOAD_DATA',
+               'NHIS_PUBLIC_ACCESS','NHIS_PUBLIC_MESSAGES_PER_HOUR','NHIS_PUBLIC_MESSAGES_PER_DAY',
+               'NHIS_PUBLIC_CHATS_PER_HOUR','NHIS_PUBLIC_CHATS_PER_DAY'}
     for line in path.read_text(encoding='utf-8').splitlines():
         line = line.strip()
         if not line or line.startswith('#') or '=' not in line:
@@ -44,18 +51,76 @@ def load_environment():
             os.environ.setdefault(key.strip(), value.strip().strip('\"\''))
 
 
-def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=None):
+def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=None,
+                public_access=False, public_limits=None):
     from nhis_agent.conversation import ConversationService
     from nhis_agent.jobs import ChatJobs, ConversationBusy
     # The factory is created once per server; jobs remain discoverable across requests.
     conversations = ConversationService(agent) if agent is not None else None
     chat_jobs = ChatJobs(conversations) if conversations is not None else None
-    artifact_root = Path(agent.root) if agent is not None else ROOT
     configured_hosts = {str(value).strip().lower() for value in (allowed_hosts or []) if str(value).strip()}
     configured_origins = {str(value).strip().rstrip('/') for value in (allowed_origins or []) if str(value).strip()}
+    access = workspaces = None
+    status_cache = {}
+    status_lock = threading.Lock()
+    if public_access:
+        from nhis_agent.access import PublicAccess
+        from nhis_agent.workspaces import VisitorWorkspaces
+        access = PublicAccess(auth_secret, state_dir=agent.root,
+                              secure=any(value.startswith('https://') for value in configured_origins),
+                              **(public_limits or {}))
+        workspaces = VisitorWorkspaces(agent)
+
+    def public_status():
+        # A status refresh must not spawn one R probe for every public request.
+        with status_lock:
+            if time.monotonic() - status_cache.get('at', float('-inf')) >= 30:
+                state = agent.status()
+                dataset = state.get('data', {})
+                statistics = state.get('statistics', {})
+                keep = ('ready', 'income_ready', 'year', 'source', 'row_count', 'sha256')
+                clean_data = {key:dataset[key] for key in keep if key in dataset}
+                clean_data['datasets'] = {name:{key:item[key] for key in keep if key in item}
+                                          for name,item in dataset.get('datasets', {}).items() if isinstance(item,dict)}
+                clean_data['message'] = ('The official NHIS files are verified.' if dataset.get('ready') else
+                                         'The site owner has not yet prepared the official NHIS data.')
+                clean_stats = {key:statistics[key] for key in ('ready','r_version','survey_version','jsonlite_version','mitools_version') if key in statistics}
+                if not statistics.get('ready'):
+                    clean_stats['reason'] = 'The site owner needs to prepare the statistical environment.'
+                configured = bool(state.get('dialogue', {}).get('configured'))
+                status_cache['value'] = {
+                    'data':clean_data, 'statistics':clean_stats,
+                    'dialogue':{'configured':configured, 'connection':{'status':'unverified' if configured else 'not_configured'},
+                                'message':'The model connection is configured; availability is checked when you send a message.' if configured else
+                                          'The site owner has not configured the model connection.'},
+                    'capabilities':state.get('capabilities', []), 'registry':state.get('registry', {}),
+                    'validation':state.get('validation', {}),
+                }
+                status_cache['at'] = time.monotonic()
+            return dict(status_cache['value'])
 
     class Handler(BaseHTTPRequestHandler):
         server_version = 'NHISLocal/0.1'
+
+        def setup(self):
+            self._visitor_id = None
+            self._set_cookie = None
+            self._lease = None
+            super().setup()
+
+        def finish(self):
+            try:
+                super().finish()
+            finally:
+                if self._lease is not None:
+                    workspaces.release(self._visitor_id)
+
+        def _workspace(self, *, create=False):
+            if not public_access:
+                return SimpleNamespace(agent=agent, conversations=conversations, jobs=chat_jobs)
+            if self._lease is None:
+                self._lease = workspaces.acquire(self._visitor_id, create=create)
+            return self._lease
 
         def log_message(self, fmt, *args):
             # Request bodies and secret config fields never enter HTTP logs.
@@ -75,6 +140,13 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
             return True
 
         def _authenticated(self):
+            if public_access:
+                self._visitor_id, self._set_cookie = access.visitor(self.headers.get('Cookie', ''))
+                if self._set_cookie and self.command in ('POST', 'DELETE'):
+                    self._json({'error':'Enable cookies and refresh the page before continuing.',
+                                'code':'cookies_required'}, 401)
+                    return False
+                return True
             if not auth_secret:
                 return True
             supplied = self.headers.get('Authorization') or ''
@@ -99,7 +171,7 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
             self.wfile.write(body)
             return False
 
-        def _send(self, body, content_type, status=200, filename=None):
+        def _send(self, body, content_type, status=200, filename=None, headers=None):
             self.send_response(status)
             self.send_header('Content-Type', content_type)
             self.send_header('Content-Length', str(len(body)))
@@ -108,13 +180,37 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
             self.send_header('X-Frame-Options', 'DENY')
             self.send_header('Referrer-Policy', 'no-referrer')
             self.send_header('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'")
+            if self._set_cookie:
+                self.send_header('Set-Cookie', self._set_cookie)
+            for key,value in (headers or {}).items():
+                self.send_header(key, str(value))
             if filename:
                 self.send_header('Content-Disposition', 'attachment; filename="' + filename + '"')
             self.end_headers()
             self.wfile.write(body)
 
-        def _json(self, value, status=200):
-            self._send(json.dumps(browser_payload(value), ensure_ascii=False, allow_nan=False).encode(), 'application/json; charset=utf-8', status)
+        def _json(self, value, status=200, *, headers=None):
+            self._send(json.dumps(browser_payload(value), ensure_ascii=False, allow_nan=False).encode(), 'application/json; charset=utf-8', status, headers=headers)
+
+        def _admit(self, kind, action):
+            if not public_access:
+                return action(None)
+            # Paid work cannot begin until the durable quota transaction commits.
+            admission = Future() if kind == 'message' else None
+            try:
+                reservation = access.reserve(self._visitor_id, kind=kind, accept=lambda:action(admission))
+            except BaseException:
+                if admission is not None:
+                    admission.set_result(False)
+                raise
+            if admission is not None:
+                admission.set_result(reservation['allowed'])
+            if not reservation['allowed']:
+                retry = reservation['retry_after']
+                self._json({'error':'The public usage limit has been reached. Please try again later.',
+                            'code':'rate_limited', 'retry_after':retry}, 429, headers={'Retry-After':retry})
+                return None
+            return reservation['value']
 
         def do_GET(self):
             path = urlsplit(self.path).path
@@ -129,7 +225,9 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
                 return
             if path == '/api/conversations':
                 try:
-                    self._json({'conversations':conversations.list()})
+                    self._json({'conversations':self._workspace().conversations.list()})
+                except FileNotFoundError:
+                    self._json({'conversations':[]})
                 except Exception:
                     self._json({'error':'Conversation records could not be loaded. Try again later.'}, 500)
                 return
@@ -138,11 +236,12 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
             if chat_match or job_match:
                 try:
                     if chat_match:
-                        conversation = conversations.get(chat_match[1])
-                        conversation['active_job_id'] = chat_jobs.active_job(chat_match[1])
+                        workspace = self._workspace()
+                        conversation = workspace.conversations.get(chat_match[1])
+                        conversation['active_job_id'] = workspace.jobs.active_job(chat_match[1])
                         self._json(conversation)
                     else:
-                        self._json(chat_jobs.get(job_match[1]))
+                        self._json(self._workspace().jobs.get(job_match[1]))
                 except FileNotFoundError as error:
                     self._json({'error':str(error)}, 404)
                 except ValueError as error:
@@ -152,21 +251,30 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
                 return
             if path == '/api/status':
                 try:
-                    self._json(agent.status())
+                    state = public_status() if public_access else agent.status()
+                    state['access'] = {'public':public_access, 'scope':('public-' + hashlib.sha256(self._visitor_id.encode()).hexdigest()[:16]) if public_access else 'private'}
+                    self._json(state)
                 except Exception:
                     self._json({'error': 'The status check failed. See the local service log.'}, 500)
                 return
             if path == '/api/runs':
                 try:
-                    self._json({'runs': agent.history()})
+                    self._json({'runs': self._workspace().agent.history()})
+                except FileNotFoundError:
+                    self._json({'runs':[]})
                 except Exception:
                     self._json({'error': 'History could not be loaded. Try again later.'}, 500)
                 return
             match = re.fullmatch(r'/api/runs/([0-9]{8}T[0-9]{6}Z-[a-f0-9]{10})(?:/(report|csv))?', path)
             if match:
                 name = {'report': 'report.md', 'csv': 'estimates.csv', None: 'result.json'}[match[2]]
-                target = artifact_root / 'runs' / match[1] / name
-                if not target.is_file():
+                try:
+                    root = Path(self._workspace().agent.root)
+                except FileNotFoundError:
+                    self._json({'error':'This analysis does not exist.'}, 404)
+                    return
+                target = root / 'runs' / match[1] / name
+                if target.is_symlink() or target.parent.is_symlink() or not target.is_file():
                     self._json({'error': 'The record does not exist or did not pass release checks.'}, 404)
                     return
                 ctype = {'report': 'text/markdown; charset=utf-8', 'csv': 'text/csv; charset=utf-8', None: 'application/json; charset=utf-8'}[match[2]]
@@ -198,11 +306,18 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
                     raise ValueError('The request must be a JSON object.')
                 path = urlsplit(self.path).path
                 message_match = re.fullmatch(r'/api/conversations/([a-f0-9]{32})/messages', path)
+                if public_access and (path in ('/api/ask', '/api/setup-data') or (message_match and value.get('measure_model', False) is not False)):
+                    self._json({'error':'This operation is available only in a private workspace.'}, 403)
+                    return
                 if path == '/api/conversations':
-                    self._json(conversations.create(), 201)
+                    result = self._admit('create', lambda admission:self._workspace(create=True).conversations.create())
+                    if result is not None:
+                        self._json(result, 201)
                 elif message_match:
-                    self._json(chat_jobs.submit(message_match[1], value.get('message', ''),
-                        value.get('measure_model', False), value.get('repeats', 5), value.get('prompt_versions', 3)), 202)
+                    result = self._admit('message', lambda admission:self._workspace().jobs.submit(message_match[1], value.get('message', ''),
+                        value.get('measure_model', False), value.get('repeats', 5), value.get('prompt_versions', 3), admission=admission))
+                    if result is not None:
+                        self._json(result, 202)
                 elif path == '/api/ask':
                     self._json(agent.ask(value.get('question', ''), value.get('measure_model', False),
                                          value.get('repeats', 5), value.get('prompt_versions', 3)))
@@ -230,9 +345,15 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
             match = re.fullmatch(r'/api/conversations/([a-f0-9]{32})', path)
             try:
                 if path == '/api/conversations':
-                    self._json(chat_jobs.clear_conversations())
+                    try:
+                        self._json(self._workspace().jobs.clear_conversations())
+                    except FileNotFoundError:
+                        self._json({'deleted':[], 'deleted_count':0})
                 elif match:
-                    self._json(chat_jobs.delete_conversation(match[1]))
+                    workspace = self._workspace()
+                    if public_access:
+                        workspace.conversations.get(match[1])
+                    self._json(workspace.jobs.delete_conversation(match[1]))
                 else:
                     self._json({'error':'Not found'},404)
             except (ConversationBusy, RuntimeError) as error:
@@ -271,12 +392,24 @@ def main():
     allowed_hosts = [value.strip() for value in os.environ.get('NHIS_ALLOWED_HOSTS','').split(',') if value.strip()]
     allowed_origins = [value.strip().rstrip('/') for value in os.environ.get('NHIS_ALLOWED_ORIGINS','').split(',') if value.strip()]
     auth_secret = os.environ.get('WEB_AUTH_SECRET','')
+    from deploy.entrypoint import public_access as parse_public_access, public_limit, PUBLIC_LIMITS
+    try:
+        public = parse_public_access(os.environ.get('NHIS_PUBLIC_ACCESS', 'false'))
+        limits = {name.removeprefix('NHIS_PUBLIC_').lower():public_limit(name, os.environ.get(name, str(default)))
+                  for name,default in PUBLIC_LIMITS.items()} if public else {}
+    except ValueError as error:
+        parser.exit(1, str(error) + '\n')
     if args.host not in ('127.0.0.1','localhost','::1'):
-        if len(auth_secret) < 32 or not allowed_hosts or not allowed_origins:
+        if len(auth_secret.strip()) < 32 or not allowed_hosts or not allowed_origins:
             parser.exit(1,'Remote hosting requires WEB_AUTH_SECRET (at least 32 characters), NHIS_ALLOWED_HOSTS, and NHIS_ALLOWED_ORIGINS.\n')
+        if public and any(not origin.startswith('https://') for origin in allowed_origins):
+            parser.exit(1,'Public hosting requires HTTPS origins.\n')
+    if public and len(auth_secret.strip()) < 32:
+        parser.exit(1,'Public access requires WEB_AUTH_SECRET (at least 32 characters) to sign visitor sessions.\n')
+    public_options = {'public_access':True, 'public_limits':limits} if public else {}
     try:
         server = ThreadingHTTPServer((args.host, args.port), handler_for(agent, allowed_hosts=allowed_hosts,
-                    allowed_origins=allowed_origins, auth_secret=auth_secret))
+                    allowed_origins=allowed_origins, auth_secret=auth_secret, **public_options))
     except OSError as error:
         hint = 'This execution environment does not permit listening on a port. Run the startup script in a local terminal.' if error.errno in (1,13) else 'Use --port 8766 to select another port.'
         parser.exit(1, 'Unable to start the local service: {}. {}\n'.format(error, hint))

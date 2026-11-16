@@ -8,12 +8,19 @@ import argparse
 import os
 from pathlib import Path
 import pwd
+import re
 import sys
 import threading
 from urllib.parse import urlsplit
 
 CODE_ROOT = Path(__file__).resolve().parents[1]
-STATE_SUBDIRECTORIES = ('data', 'runs', 'conversations', '.cache')
+STATE_SUBDIRECTORIES = ('data', 'runs', 'conversations', '.cache', 'visitors')
+PUBLIC_LIMITS = {
+    'NHIS_PUBLIC_MESSAGES_PER_HOUR': 20,
+    'NHIS_PUBLIC_MESSAGES_PER_DAY': 200,
+    'NHIS_PUBLIC_CHATS_PER_HOUR': 10,
+    'NHIS_PUBLIC_CHATS_PER_DAY': 200,
+}
 
 
 def enabled(value):
@@ -23,6 +30,23 @@ def enabled(value):
     if value in ('false', '0', 'no', 'off', ''):
         return False
     raise ValueError('NHIS_AUTO_DOWNLOAD_DATA must be true or false.')
+
+
+def public_access(value):
+    """Public access must be deliberately selected, never truth-tested as text."""
+    if not isinstance(value, str) or value.strip().lower() not in ('true', 'false'):
+        raise ValueError('NHIS_PUBLIC_ACCESS must be true or false.')
+    return value.strip().lower() == 'true'
+
+
+def public_limit(name, value):
+    """Use bounded ASCII integers, rejecting signs, fractions and truthy words."""
+    if not isinstance(value, str) or not re.fullmatch(r'[0-9]{1,6}', value.strip()):
+        raise ValueError(name + ' must be an integer between 1 and 100000.')
+    number = int(value.strip())
+    if not 1 <= number <= 100000:
+        raise ValueError(name + ' must be an integer between 1 and 100000.')
+    return number
 
 
 def configure_environment(environ):
@@ -38,6 +62,10 @@ def configure_environment(environ):
     environ.setdefault('NHIS_STATE_DIR', '/var/lib/nhis')
     if len(environ.get('WEB_AUTH_SECRET', '').strip()) < 32:
         raise ValueError('Set a server-only WEB_AUTH_SECRET of at least 32 characters before startup.')
+    public = public_access(environ.get('NHIS_PUBLIC_ACCESS', 'false'))
+    environ['NHIS_PUBLIC_ACCESS'] = 'true' if public else 'false'
+    for name, default in PUBLIC_LIMITS.items():
+        environ[name] = str(public_limit(name, environ.get(name, str(default))))
     download = enabled(environ.get('NHIS_AUTO_DOWNLOAD_DATA', 'false'))
 
     # Platform-provided identity is trusted configuration, never a request header.

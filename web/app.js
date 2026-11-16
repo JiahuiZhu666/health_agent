@@ -9,22 +9,56 @@
   const number = (value) => finite(value) ? value.toLocaleString('en-US') : '—';
   const runPattern = /^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{10}$/;
   const conversationPattern = /^[a-f0-9]{32}$/;
-  const storageKey = 'nhis_active_conversation_en_v2';
+  let storageKey = 'nhis_active_conversation_en_v2', accessScope = null;
   const mobile = window.matchMedia('(max-width: 768px)');
   const runs = new Map(), conversations = new Map(), dialogOpeners = new WeakMap(), deletedConversationIds = new Set();
   let state = null, activeConversation = null, lastResult = null;
   let busy = false, composing = false, currentJobId = null, generation = 0;
   let pollTimer = null, autoFollow = true, jobEvents = [], processSelection = 'live', publicRecordUrl = null;
   let historyRevision = 0, pendingDeletion = null, deleting = false;
-  const errorText = (error) => error?.name === 'AbortError' ? 'The request timed out. Check the local service and try again.' : error?.message || 'The request could not be completed. Please try again.';
+  const isPublic = () => state?.access?.public === true;
+  const ownerAllowed = () => state?.access?.public === false;
+  const cookiesUnavailable = () => isPublic() && typeof navigator !== 'undefined' && navigator.cookieEnabled === false;
+  const cookieMessage = 'Cookies are required to keep your chats separate from other visitors. Enable cookies for this site, then reload the page.';
+  const errorText = (error) => error?.name === 'AbortError' ? 'The request timed out. Check your connection and try again.' : error?.message || 'The request could not be completed. Please try again.';
+
+  function publicGuidance(value) {
+    const message = String(value ?? '');
+    if (!isPublic()) return message;
+    return message
+      .replace('Select Download official data or run scripts/setup.command in a terminal.', 'The site operator prepares and verifies official data. Please try this analysis again later.')
+      .replace('Run scripts/setup.command in a local terminal and check the network connection.', 'The site operator is responsible for preparing the official data. Please try this analysis again later.')
+      .replace('The service is not ready. Please check the server configuration.', 'Chat is temporarily unavailable. Please try again later.');
+  }
+
+  function retryAfterSeconds(value) {
+    if (value == null || value === '') return null;
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && numeric >= 0) return Math.ceil(numeric);
+    const date = Date.parse(String(value));
+    return Number.isNaN(date) ? null : Math.max(0, Math.ceil((date - Date.now()) / 1000));
+  }
+  function rateLimitMessage(seconds) {
+    if (seconds == null) return 'Too many requests. Please wait before trying again.';
+    if (seconds === 0) return 'Too many requests. Please try again shortly.';
+    const unit = seconds >= 3600 ? 'hour' : seconds >= 60 ? 'minute' : 'second';
+    const amount = Math.ceil(seconds / (unit === 'hour' ? 3600 : unit === 'minute' ? 60 : 1));
+    return `Too many requests. Try again in ${amount} ${unit}${amount === 1 ? '' : 's'}.`;
+  }
 
   async function api(path, data, timeout = 30000, method = data === undefined ? 'GET' : 'POST') {
+    if (path !== '/api/status' && cookiesUnavailable()) throw new Error(cookieMessage);
     const controller = new AbortController(), timer = setTimeout(() => controller.abort(), timeout);
     try {
       const response = await fetch(path, {method, headers: data === undefined ? undefined : {'Content-Type': 'application/json'}, body: data === undefined ? undefined : JSON.stringify(data), credentials: 'same-origin', cache: 'no-store', signal: controller.signal});
       let result;
       try { result = await response.json(); } catch (_) { throw new Error(`The service did not return readable JSON (HTTP ${response.status}). `); }
-      if (!response.ok) { const error = new Error(typeof result.error === 'string' ? result.error : result.message || `Request failed (HTTP ${response.status}).`); error.status = response.status; throw error; }
+      if (!response.ok) {
+        const code = result.error_code || result.code || result.error?.code;
+        const retry = retryAfterSeconds(response.headers?.get?.('Retry-After') ?? result.retry_after ?? result.retry_after_seconds);
+        const message = code === 'cookies_required' ? cookieMessage : response.status === 429 ? rateLimitMessage(retry) : response.status >= 500 ? 'The service could not complete this request. Please try again later.' : typeof result.error === 'string' ? result.error : result.message || `Request failed (HTTP ${response.status}).`;
+        const error = new Error(message); error.status = response.status; error.code = code; error.retryAfterSeconds = retry; throw error;
+      }
       return result;
     } finally { clearTimeout(timer); }
   }
@@ -66,6 +100,35 @@
   }
   function openView(name) { if (['methods', 'data', 'history'].includes(name)) { openDialog(`${name}-dialog`); if (name === 'history') loadHistory(); if (name === 'data') refreshStatus(); } }
   function saveActive(id) { try { if (conversationPattern.test(id || '')) sessionStorage.setItem(storageKey, id); else sessionStorage.removeItem(storageKey); } catch (_) { /* Storage is optional. */ } }
+  async function requireSession() {
+    if (!state) await refreshStatus();
+    if (!state) throw new Error('Unable to confirm the service status. Refresh the page and try again.');
+    if (cookiesUnavailable()) throw new Error(cookieMessage);
+  }
+  function applyAccess(status) {
+    const scope = String(status.access?.scope || (status.access?.public === true ? 'public' : 'private'));
+    const changed = accessScope !== null && accessScope !== scope;
+    if (changed) {
+      ++generation; ++historyRevision; saveActive(null); conversations.clear(); runs.clear(); deletedConversationIds.clear();
+      clearConversationView(); $('history-list').replaceChildren(); $('results').hidden = true; $('process-timeline').replaceChildren();
+      for (const id of ['result-context', 'result-answer', 'result-messages', 'results-body', 'ci-chart', 'derived-results', 'comparison-body', 'gradient-comparison', 'artifact-links', 'survey-note', 'measurement-note', 'run-id']) $(id).replaceChildren();
+      $('conversation-search').value = ''; $('load-run-id').value = ''; $('load-run-button').disabled = false; text($('history-error'), ''); text($('delete-description'), '');
+      document.title = 'NHIS Lab · Chat and research'; showSystemError('');
+      if (publicRecordUrl) { URL.revokeObjectURL(publicRecordUrl); publicRecordUrl = null; }
+      pendingDeletion = null; deleting = false; $('delete-confirm').disabled = false; $('delete-cancel').disabled = false;
+      document.querySelectorAll('dialog[open]').forEach((dialog) => { if (dialog.id !== 'data-dialog') closeDialog(dialog); });
+      setBusy(false);
+    }
+    accessScope = scope;
+    storageKey = isPublic() ? `nhis_active_conversation_en_v2_${scope}` : 'nhis_active_conversation_en_v2';
+    const owner = ownerAllowed();
+    $('measure-model').disabled = busy || !owner;
+    if (!owner) $('measure-model').checked = false;
+    $('measure-option').title = owner ? 'Optional extra calls using group definitions only, without survey estimates or chat history' : 'Independent model benchmarks are managed by the site operator.';
+    $('public-access-note').hidden = !isPublic();
+    text($('history-intro'), isPublic() ? 'Only analyses from this browser’s session appear here. Opening a record does not change the active chat or its research scope.' : 'Open saved analyses. Viewing a record does not change the active chat or its research scope.');
+    if (changed) { renderConversationHistory(); renderHistory(); }
+  }
 
   function safeMarkdownUrl(value) {
     const candidate = String(value).trim();
@@ -213,14 +276,15 @@
   function renderServiceStatus(dialogue = {}) {
     const connected = dialogue.connection?.status === 'ok';
     text($('service-status'), connected ? 'Service is ready' : dialogue.configured ? 'Service status not yet confirmed' : 'Service is not ready');
-    text($('service-detail'), connected ? 'Chat responses and independent benchmarks are managed by the server.' : dialogue.configured ? 'Connection status will update after an actual reply.' : 'The service is not ready. Please check the server configuration.');
+    text($('service-detail'), connected ? isPublic() ? 'Chat responses are managed by the site operator.' : 'Chat responses and independent benchmarks are managed by the server.' : dialogue.configured ? isPublic() ? 'Chat availability is checked when you send a message.' : 'Connection status will update after an actual reply.' : isPublic() ? 'Chat is temporarily unavailable. Please try again later.' : 'The service is not ready. Please check the server configuration.');
   }
 
   function displayMessage(value) {
     // Normalize obsolete setup guidance in saved replies without translating user text.
-    return String(value).replace(/请先在模型设置中保存并测试连接[。.]/g, 'The service is not ready. Please check the server configuration.')
+    const message = String(value).replace(/请先在模型设置中保存并测试连接[。.]/g, 'The service is not ready. Please check the server configuration.')
       .replace(/尚未连接真实 API，请在模型设置中填写模型名称和密钥[。.]/g, 'The service is not ready. Please check the server configuration.')
       .replace(/请在模型连接设置的密码输入框填写密钥，不要把密钥作为研究问题发送[。.]/g, 'Check the server configuration. Do not send credentials in chat.');
+    return publicGuidance(message);
   }
 
   const categoryLabels = {
@@ -297,6 +361,7 @@
     $('activity').hidden = !value || !showActivity; $('activity-spinner').hidden = !value;
     document.querySelectorAll('[data-question], .chat-suggestions button, [data-delete-conversation], .sidebar-conversation').forEach((button) => { button.disabled = value; });
     $('clear-conversations').disabled = value || !conversations.size;
+    $('measure-model').disabled = value || !ownerAllowed();
     scrollBottom();
   }
   function clearConversationView() {
@@ -309,6 +374,7 @@
     if (busy) return;
     const version = ++generation; setBusy(true); closeSidebar(); showSystemError('');
     try {
+      await requireSession(); if (version !== generation) return;
       const response = await api('/api/conversations', {}, 20000); if (version !== generation) return;
       const conversation = response.conversation || response; if (!conversationPattern.test(conversation.id || '')) throw new Error('Unable to create a new chat.');
       clearConversationView(); renderConversation(conversation, true); void loadHistory(); $('question').focus();
@@ -347,13 +413,14 @@
     const version = generation; setBusy(true); showSystemError(''); jobEvents = []; processSelection = 'live'; $('activity-process').hidden = true;
     text($('activity-title'), 'Sending message'); text($('activity-detail'), '');
     try {
+      await requireSession(); if (version !== generation) return;
       if (!activeConversation?.id) {
         const response = await api('/api/conversations', {}, 20000); if (version !== generation) return;
         const conversation = response.conversation || response; if (!conversationPattern.test(conversation.id || '')) throw new Error('Unable to start the chat.'); renderConversation(conversation);
       }
       const conversationId = activeConversation.id;
       appendMessage('user', question); scrollBottom(true);
-      const response = await api(`/api/conversations/${conversationId}/messages`, {message: question, measure_model: $('measure-model').checked, repeats: 5, prompt_versions: 3});
+      const response = await api(`/api/conversations/${conversationId}/messages`, {message: question, measure_model: ownerAllowed() && $('measure-model').checked, repeats: 5, prompt_versions: 3});
       if (version !== generation || activeConversation?.id !== conversationId) return;
       $('question').value = ''; autoGrow();
       if (response.job_id) await pollJob(response.job_id, version, conversationId);
@@ -423,7 +490,7 @@
       jobEvents = actualEvents;
       $('activity-process').hidden = !jobEvents.length;
       const latest = jobEvents[jobEvents.length - 1];
-      if (latest && busy) { text($('activity-title'), processLabel(latest)); text($('activity-detail'), typeof latest.detail === 'string' ? latest.detail : ''); scrollBottom(); }
+      if (latest && busy) { text($('activity-title'), processLabel(latest)); text($('activity-detail'), typeof latest.detail === 'string' ? publicGuidance(latest.detail) : ''); scrollBottom(); }
       if (processSelection !== 'live') return;
     }
     const timeline = $('process-timeline'); timeline.replaceChildren(); $('process-details').hidden = !actualEvents.length;
@@ -434,7 +501,7 @@
       const status = {running: 'In progress', complete: 'Complete', completed: 'Complete', passed: 'Passed', failed: 'Incomplete', blocked: 'Needs attention', skipped: 'Not run'}[event.status];
       text(heading, [processLabel(event), status].filter(Boolean).join(' · ')); item.append(heading);
       if (event.timestamp) { const date = new Date(event.timestamp), time = document.createElement('time'); text(time, Number.isNaN(date.getTime()) ? event.timestamp : date.toLocaleTimeString('en-US', {hour12: false})); item.append(time); }
-      if (typeof event.detail === 'string' && event.detail) { const p = document.createElement('p'); text(p, event.detail); item.append(p); }
+      if (typeof event.detail === 'string' && event.detail) { const p = document.createElement('p'); text(p, publicGuidance(event.detail)); item.append(p); }
       const humanFacts = humanProcessFacts(facts); if (humanFacts.length) { const p = document.createElement('p'); text(p, humanFacts.join('; ')); item.append(p); }
       if (records.some((record) => record.facts && Object.keys(record.facts).length)) { const details = document.createElement('details'), summary = document.createElement('summary'), pre = document.createElement('pre'); text(summary, 'Technical record'); text(pre, JSON.stringify(records.map(safeFacts), null, 2)); details.append(summary, pre); item.append(details); }
       timeline.append(item);
@@ -449,7 +516,7 @@
 
   function renderResults(result) {
     $('results').hidden = false;
-    text($('result-answer'), result.answer || 'See the status and available output for this analysis.');
+    text($('result-answer'), publicGuidance(result.answer || 'See the status and available output for this analysis.'));
     const sourceSurvey = result.survey || {};
     const canPublish = result.status === 'ok' && sourceSurvey.status === 'ok';
     const survey = canPublish ? sourceSurvey : {rows: [], message: sourceSurvey.message || sourceSurvey.reason || '', regression: sourceSurvey.regression ? {status: 'blocked', reason: sourceSurvey.regression.reason || 'This analysis did not pass the release checks'} : undefined};
@@ -478,7 +545,7 @@
     const messages = [...asArray(result.messages), ...asArray(result.survey?.warnings)];
     if (!hasResults && !hasDerived) messages.unshift('No survey estimates were generated. Follow the reply to prepare data, clarify the question, or revise the research scope.');
     for (const message of messages) {
-      const p = document.createElement('p'); text(p, typeof message === 'string' ? message : message.message || JSON.stringify(message)); $('result-messages').append(p);
+      const p = document.createElement('p'); text(p, publicGuidance(typeof message === 'string' ? message : message.message || JSON.stringify(message))); $('result-messages').append(p);
     }
     const body = $('results-body'); body.replaceChildren();
     for (const row of rows) {
@@ -629,14 +696,14 @@
   }
 
   async function refreshStatus() {
-    try { state = await api('/api/status', undefined, 20000); renderStatus(state); }
-    catch (error) { text($('connection-badge'), 'Local service is unavailable'); $('connection-badge').className = 'pill error'; text($('top-data-label'), 'Disconnected'); if ($('data-dialog').open) showSystemError(errorText(error)); }
+    try { state = await api('/api/status', undefined, 20000); applyAccess(state); renderStatus(state); return true; }
+    catch (error) { text($('connection-badge'), 'Service is unavailable'); $('connection-badge').className = 'pill error'; text($('top-data-label'), 'Disconnected'); if ($('data-dialog').open || error.code === 'cookies_required') showSystemError(errorText(error)); return false; }
   }
   function renderStatus(status) {
     const data = status.data || {}, stats = status.statistics || {};
-    text($('top-data-label'), data.ready ? 'Real data ready' : 'Prepare data'); $('top-data-dot').className = `live-dot${data.ready ? '' : ' muted-dot'}`;
+    text($('top-data-label'), data.ready ? 'Real data ready' : isPublic() ? 'Data not ready' : 'Prepare data'); $('top-data-dot').className = `live-dot${data.ready ? '' : ' muted-dot'}`;
     renderServiceStatus(status.dialogue || {});
-    text($('connection-badge'), 'Local service connected'); $('connection-badge').className = 'pill ready';
+    text($('connection-badge'), isPublic() ? 'Service connected' : 'Local service connected'); $('connection-badge').className = 'pill ready';
     text($('data-status'), data.ready ? 'Real survey data ready' : 'Real data not yet prepared');
     text($('data-detail'), data.ready ? `${finite(data.row_count) ? number(data.row_count) + ' records · ' : ''}${data.file ? String(data.file).split(/[\\/]/).pop() : 'Official NHIS adult public-use file'}` : data.message || 'Official NHIS 2024 adult public-use file');
     $('data-dot').className = `status-dot ${data.ready ? 'ready' : 'pending'}`;
@@ -645,10 +712,10 @@
     $('data-notice').hidden = !!data.ready && !!data.income_ready;
     const download = data.download || status.download || {}, stage = download.status || '';
     const downloading = ['running', 'started', 'downloading', 'preparing', 'extracting', 'in_progress'].includes(stage);
-    $('setup-data').disabled = downloading; text($('setup-data'), downloading ? 'Preparing…' : 'Download official data');
+    $('setup-data').disabled = downloading || !ownerAllowed(); $('setup-data').hidden = isPublic(); text($('setup-data'), downloading ? 'Preparing…' : 'Download official data');
     text($('download-title'), downloading ? 'Preparing official data' : data.ready ? 'Adult data ready; income imputations pending' : 'Prepare real survey data');
-    text($('download-detail'), download.message || data.income_message || data.message || 'Download and verify official files. No simulated estimates are generated.');
-    $('runtime-notice').hidden = !!stats.ready; text($('runtime-detail'), 'Run scripts/setup.command locally to prepare the statistical dependencies.' + (stats.reason ? ' ' + stats.reason : ''));
+    text($('download-detail'), isPublic() ? 'The site operator prepares and verifies official data. You can continue chatting while data preparation is pending.' : download.message || data.income_message || data.message || 'Download and verify official files. No simulated estimates are generated.');
+    $('runtime-notice').hidden = !!stats.ready; text($('runtime-detail'), isPublic() ? 'The statistical service is being prepared by the site operator. Please try research analyses again later.' : 'Run scripts/setup.command locally to prepare the statistical dependencies.' + (stats.reason ? ' ' + stats.reason : ''));
     text($('data-provenance'), JSON.stringify({data, statistics: stats, validation: status.validation || {}}, null, 2));
     text($('registry-content'), JSON.stringify({registry: status.registry || {}, capabilities: status.capabilities || {}}, null, 2));
     clearTimeout(pollTimer); if (downloading) pollTimer = setTimeout(refreshStatus, 3000);
@@ -671,15 +738,15 @@
         conversations.set(item.id, {...cached, ...item});
       }
       renderConversationHistory();
-    } else if (!conversations.size) { text($('conversation-history'), 'Unable to load saved chats right now.'); $('conversation-history').classList.add('sidebar-empty'); }
-    if (runResponse.status === 'rejected' && $('history-dialog').open) text($('history-error'), 'Unable to load analysis records. Please try again.');
+    } else if (!conversations.size) { text($('conversation-history'), errorText(conversationResponse.reason)); $('conversation-history').classList.add('sidebar-empty'); }
+    if (runResponse.status === 'rejected' && $('history-dialog').open) text($('history-error'), errorText(runResponse.reason));
   }
   function renderConversationHistory() {
     const host = $('conversation-history'); host.replaceChildren(); host.classList.remove('sidebar-empty');
     const search = $('conversation-search').value.trim().toLocaleLowerCase();
     const items = [...conversations.values()].filter((item) => !deletedConversationIds.has(item.id) && (!search || String(item.title || 'New chat').toLocaleLowerCase().includes(search))).sort((a, b) => String(b.updated_at || b.created_at || '').localeCompare(String(a.updated_at || a.created_at || '')));
     $('clear-conversations').disabled = busy || !conversations.size;
-    if (!items.length) { const p = document.createElement('p'); p.className = 'sidebar-empty'; text(p, search ? 'No matching chats.' : 'Chats are saved locally.'); host.append(p); return; }
+    if (!items.length) { const p = document.createElement('p'); p.className = 'sidebar-empty'; text(p, search ? 'No matching chats.' : isPublic() ? 'Your saved chats appear here. Cookies keep this browser’s history separate.' : 'Your saved chats appear here.'); host.append(p); return; }
     for (const item of items) {
       const row = document.createElement('div'); row.className = `sidebar-chat-row${item.id === activeConversation?.id ? ' active' : ''}`;
       const button = document.createElement('button'); button.type = 'button'; button.className = `sidebar-conversation${item.id === activeConversation?.id ? ' active' : ''}`;
@@ -696,7 +763,7 @@
     if (id !== null && (!conversationPattern.test(id) || deletedConversationIds.has(id))) return;
     pendingDeletion = {id, title: id === null ? '' : conversations.get(id)?.title || 'New chat'};
     text($('delete-title'), id === null ? 'Clear all chats?' : 'Delete this chat?');
-    text($('delete-description'), id === null ? 'This permanently deletes every saved chat. This cannot be undone. Analysis records remain available.' : `“${pendingDeletion.title}” will be permanently deleted. This cannot be undone. Analysis records remain available.`);
+    text($('delete-description'), id === null ? isPublic() ? 'This permanently deletes all chats for this browser’s session. This cannot be undone. Your analysis records remain available.' : 'This permanently deletes every saved chat. This cannot be undone. Analysis records remain available.' : `“${pendingDeletion.title}” will be permanently deleted. This cannot be undone. Analysis records remain available.`);
     text($('delete-confirm'), id === null ? 'Clear all chats' : 'Delete chat'); text($('delete-error'), '');
     $('delete-confirm').disabled = false; $('delete-cancel').disabled = false; openDialog('delete-dialog'); $('delete-cancel').focus();
   }
@@ -747,13 +814,21 @@
   }
   async function openRun(id) {
     if (!runPattern.test(id || '')) { text($('history-error'), 'Invalid run ID format.'); return; }
+    const scope = accessScope, version = generation;
     $('load-run-button').disabled = true; text($('history-error'), 'Loading saved record…');
     try {
       const cached = runs.get(id), result = cached?.result || await api(`/api/runs/${id}`);
+      if (scope !== accessScope || version !== generation) return;
       recordRun(result, cached?.question); renderResults(result); text($('results-summary-label'), 'Survey estimates and record for this run'); text($('history-error'), ''); openDialog('evidence-dialog');
       // Viewing evidence never changes the active conversation, its filters, or the composer.
-    } catch (error) { text($('history-error'), errorText(error)); if (!$('history-dialog').open) showSystemError(errorText(error)); }
-    finally { $('load-run-button').disabled = false; }
+    } catch (error) { if (scope === accessScope && version === generation) { text($('history-error'), errorText(error)); if (!$('history-dialog').open) showSystemError(errorText(error)); } }
+    finally { if (scope === accessScope && version === generation) $('load-run-button').disabled = false; }
+  }
+  async function setupData() {
+    if (!ownerAllowed()) { text($('download-detail'), 'Official data preparation is managed by the site operator.'); return; }
+    $('setup-data').disabled = true; text($('setup-data'), 'Starting…');
+    try { const result = await api('/api/setup-data', {}); if (result.status === 'error' || result.error) throw new Error(result.message || result.error); await refreshStatus(); clearTimeout(pollTimer); pollTimer = setTimeout(refreshStatus, 3000); }
+    catch (error) { text($('download-detail'), errorText(error)); $('setup-data').disabled = !ownerAllowed(); text($('setup-data'), 'Retry download'); }
   }
   $('sidebar-toggle').addEventListener('click', toggleSidebar);
   $('sidebar-close').addEventListener('click', () => { if (mobile.matches) closeSidebar(); else { document.body.classList.add('sidebar-collapsed'); closeSidebar(); } $('sidebar-toggle').focus(); });
@@ -798,14 +873,15 @@
   $('last-evidence').addEventListener('click', () => { if (lastResult) { renderResults(lastResult); openDialog('evidence-dialog'); } });
   $('load-run-form').addEventListener('submit', (event) => { event.preventDefault(); openRun($('load-run-id').value.trim()); });
   $('refresh-status').addEventListener('click', refreshStatus);
-  $('setup-data').addEventListener('click', async () => {
-    $('setup-data').disabled = true; text($('setup-data'), 'Starting…');
-    try { const result = await api('/api/setup-data', {}); if (result.status === 'error' || result.error) throw new Error(result.message || result.error); await refreshStatus(); clearTimeout(pollTimer); pollTimer = setTimeout(refreshStatus, 3000); }
-    catch (error) { text($('download-detail'), errorText(error)); $('setup-data').disabled = false; text($('setup-data'), 'Retry download'); }
-  });
+  $('setup-data').addEventListener('click', setupData);
   if (typeof ResizeObserver !== 'undefined') new ResizeObserver(() => { document.documentElement.style.setProperty('--composer-height', `${Math.ceil($('composer-dock').getBoundingClientRect().height)}px`); }).observe($('composer-dock'));
   window.addEventListener('resize', autoGrow);
-  closeSidebar(); autoGrow(); void Promise.allSettled([refreshStatus(), loadHistory()]);
-  let restoredId = null; try { restoredId = sessionStorage.getItem(storageKey); } catch (_) { /* Optional opaque ID only. */ }
-  if (conversationPattern.test(restoredId || '')) openConversation(restoredId, true);
+  async function initializeWorkspace() {
+    if (!await refreshStatus()) { if (!$('system-error').textContent) showSystemError('Unable to confirm the service status. Refresh the page and try again.'); return; }
+    if (cookiesUnavailable()) { showSystemError(cookieMessage); return; }
+    await loadHistory();
+    let restoredId = null; try { restoredId = sessionStorage.getItem(storageKey); } catch (_) { /* Optional opaque ID only. */ }
+    if (conversationPattern.test(restoredId || '')) await openConversation(restoredId, true);
+  }
+  closeSidebar(); autoGrow(); void initializeWorkspace();
 })();

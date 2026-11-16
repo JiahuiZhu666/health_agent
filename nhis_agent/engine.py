@@ -164,8 +164,11 @@ def markdown_report(result):
 
 
 class Agent:
-    def __init__(self, root=ROOT):
+    def __init__(self, root=ROOT, *, data_root=None):
         self.root = Path(root)
+        # Public visitors share the verified official input files, while all
+        # conversations, audit records and caches stay in their own workspace.
+        self.data_root = Path(data_root) if data_root is not None else self.root
         (self.root / 'runs').mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._download_state = {'status': 'idle', 'message': ''}
@@ -179,13 +182,21 @@ class Agent:
         self._model_revision = 0
         self._dialogue_connection = {'status': 'unverified', 'message': 'No real API request has been performed yet.'}
 
+    def workspace(self, root):
+        """Create isolated state with a snapshot of server-only model settings."""
+        scoped = Agent(root=root, data_root=self.data_root)
+        with self._model_config_lock:
+            scoped._model = self._model.copy()
+            scoped._model_revision = self._model_revision
+        return scoped
+
     def status(self):
         registry_path = self.root / 'config' / 'registry.json'
         if not registry_path.is_file():
             registry_path = ROOT / 'config' / 'registry.json'
         registry = json.loads(registry_path.read_text()) if registry_path.exists() else {}
         config = self._model.copy()
-        return {'data': dict(data.status(self.root), download=self._download_state.copy()),
+        return {'data': dict(data.status(self.data_root), download=self._download_state.copy()),
                 'statistics': stats.readiness(),
                 'models': models.public_status(config),
                 'dialogue': self.dialogue_status(),
@@ -336,7 +347,7 @@ class Agent:
             self._download_state = {'status': 'running', 'message': 'Downloading the official NHIS 2024 public-use files from CDC.'}
         def worker():
             try:
-                result = data.download(self.root)
+                result = data.download(self.data_root)
                 self._download_state = {'status': 'complete' if result.get('ready') or result.get('status') == 'ok' else 'failed',
                                         'message': result.get('message', 'Download finished. Check the real-data status.')}
             except Exception:
@@ -393,7 +404,7 @@ class Agent:
                   'comparison': [], 'messages': [], 'analysis_plan':plan,
                   'validation': {'r_stata': 'pending', 'nchs_external': 'pending'}}
         trace.emit('data', 'running', 'Verify the CDC download record, CSV integrity, and survey design fields without transmitting individual records.')
-        dataset = data.status(self.root)
+        dataset = data.status(self.data_root)
         if not dataset.get('ready'):
             result['answer'] = 'The official NHIS 2024 Sample Adult data have not been obtained and verified, so no statistics were generated. Select Download official data or run scripts/setup.command in a terminal.'
             result['messages'].append(dataset.get('message', 'The official data are not ready.'))
@@ -420,7 +431,7 @@ class Agent:
             write_json(directory/'cache.json', {'key':cached['key'], 'source_run_id':cached['source_run_id'],
                        'note':'R was not rerun. Aggregate estimates were reused only after matching the data, analysis specification, statistical source code, and R package versions.'})
         else:
-            survey = stats.analyze(str(self.root / 'data' / 'adult24.csv'), spec, str(directory))
+            survey = stats.analyze(str(self.data_root / 'data' / 'adult24.csv'), spec, str(directory))
         result['cache'] = {'hit':bool(cached), 'source_run_id':cached['source_run_id'] if cached else None}
         result['survey'] = survey
         if survey.get('status') != 'ok':

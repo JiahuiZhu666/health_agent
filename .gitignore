@@ -8,6 +8,7 @@ __pycache__/
 .DS_Store
 .cache/
 conversations/
+visitors/
 data/*
 !data/.gitkeep
 runs/*

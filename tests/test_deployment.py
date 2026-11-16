@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -39,7 +40,65 @@ class DeploymentEnvironmentTests(unittest.TestCase):
         self.assertEqual(values['NHIS_STATE_DIR'],'/var/lib/nhis')
         self.assertEqual(values['NHIS_ALLOWED_HOSTS'],'nhis.example')
         self.assertEqual(values['NHIS_ALLOWED_ORIGINS'],'https://nhis.example')
+        self.assertEqual(values['NHIS_PUBLIC_ACCESS'],'false')
         self.assertEqual(output.getvalue(),'')
+
+    def test_public_opt_in_preserves_signing_secret_and_sets_bounded_defaults(self):
+        values=environment(NHIS_PUBLIC_ACCESS=' TRUE ')
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            entrypoint.configure_environment(values)
+        self.assertEqual(values['NHIS_PUBLIC_ACCESS'],'true')
+        self.assertEqual(values['WEB_AUTH_SECRET'],SECRET)
+        self.assertEqual({name:values[name] for name in entrypoint.PUBLIC_LIMITS}, {
+            'NHIS_PUBLIC_MESSAGES_PER_HOUR':'20', 'NHIS_PUBLIC_MESSAGES_PER_DAY':'200',
+            'NHIS_PUBLIC_CHATS_PER_HOUR':'10', 'NHIS_PUBLIC_CHATS_PER_DAY':'200'})
+        self.assertEqual(output.getvalue(),'')
+
+    def test_public_flag_rejects_ambiguous_truthy_and_falsey_values(self):
+        for value in ('', '1', '0', 'yes', 'no', 'on', 'off', 'tru', True, False, None):
+            with self.subTest(value=value),self.assertRaisesRegex(ValueError,'NHIS_PUBLIC_ACCESS'):
+                entrypoint.configure_environment(environment(NHIS_PUBLIC_ACCESS=value))
+        for value in ('false','FALSE',' false '):
+            values=environment(NHIS_PUBLIC_ACCESS=value)
+            entrypoint.configure_environment(values)
+            self.assertEqual(values['NHIS_PUBLIC_ACCESS'],'false')
+
+    def test_public_mode_still_requires_the_server_signing_secret(self):
+        for secret in ('','short',' '*40):
+            with self.subTest(length=len(secret)),self.assertRaisesRegex(ValueError,'WEB_AUTH_SECRET'):
+                entrypoint.configure_environment(environment(NHIS_PUBLIC_ACCESS='true',WEB_AUTH_SECRET=secret))
+
+    def test_public_limit_bounds_and_canonical_integer_values(self):
+        for name in entrypoint.PUBLIC_LIMITS:
+            for value,expected in [('1','1'),('100000','100000'),(' 020 ','20')]:
+                values=environment(**{name:value})
+                entrypoint.configure_environment(values)
+                self.assertEqual(values[name],expected)
+            for value in ('0','-1','100001','1000000','1.5','1e2','+20','20/day','true','',True,20,'２０'):
+                with self.subTest(name=name,value=value),self.assertRaisesRegex(ValueError,name) as caught:
+                    entrypoint.configure_environment(environment(**{name:value}))
+                self.assertNotIn(SECRET,str(caught.exception))
+
+    def test_blueprint_is_public_free_and_generates_a_separate_signing_secret(self):
+        text=(entrypoint.CODE_ROOT/'render.yaml').read_text(encoding='utf-8')
+        fields={name:(kind,value.strip('"')) for name,kind,value in re.findall(
+            r'- key: (\w+)\n\s+(value|sync|generateValue): ([^\n]+)',text)}
+        self.assertRegex(text,r'(?m)^    plan: free$')
+        self.assertNotRegex(text,r'(?m)^    disk:')
+        self.assertEqual(fields['NHIS_PUBLIC_ACCESS'],('value','true'))
+        self.assertEqual(fields['WEB_AUTH_SECRET'],('generateValue','true'))
+        self.assertEqual(fields['OPENAI_API_KEY'],('sync','false'))
+        for name,default in entrypoint.PUBLIC_LIMITS.items():
+            self.assertEqual(fields[name],('value',str(default)))
+
+    def test_example_keeps_local_public_access_opt_in_and_contains_no_key(self):
+        text=(entrypoint.CODE_ROOT/'.env.example').read_text(encoding='utf-8')
+        fields=dict(line.split('=',1) for line in text.splitlines() if line and not line.startswith('#'))
+        self.assertEqual(fields['NHIS_PUBLIC_ACCESS'],'false')
+        self.assertEqual(fields['WEB_AUTH_SECRET'],'')
+        self.assertEqual(fields['OPENAI_API_KEY'],'')
+        for name,default in entrypoint.PUBLIC_LIMITS.items():
+            self.assertEqual(fields[name],str(default))
 
     def test_platform_url_and_explicit_custom_allowlists_are_preserved(self):
         values={'WEB_AUTH_SECRET':SECRET,'RENDER_EXTERNAL_URL':'https://unit-platform.example:8443/',
@@ -148,6 +207,76 @@ class PersistentStateTests(unittest.TestCase):
 
 
 class ServerStartupTests(unittest.TestCase):
+    def test_public_flag_and_signing_secret_are_validated_even_on_loopback(self):
+        cases=[{'NHIS_PUBLIC_ACCESS':value,'WEB_AUTH_SECRET':SECRET}
+               for value in ('yes','1','','perhaps')]
+        cases += [{'NHIS_PUBLIC_ACCESS':'true'},
+                  {'NHIS_PUBLIC_ACCESS':'true','WEB_AUTH_SECRET':'short'},
+                  {'NHIS_PUBLIC_ACCESS':'true','WEB_AUTH_SECRET':' '*40}]
+        for values in cases:
+            with self.subTest(keys=sorted(values)),TemporaryDirectory() as folder:
+                values=dict(values,NHIS_STATE_DIR=str(Path(folder)/'state'))
+                with patch.dict(os.environ,values,clear=True),patch.object(server,'load_environment'), \
+                     patch('sys.argv',['server.py','--host','127.0.0.1']),patch.object(engine,'Agent'), \
+                     patch.object(server,'ThreadingHTTPServer') as listener,patch.object(server,'handler_for') as handler, \
+                     contextlib.redirect_stderr(io.StringIO()) as errors,self.assertRaises(SystemExit) as stopped:
+                    server.main()
+                self.assertEqual(stopped.exception.code,1)
+                listener.assert_not_called();handler.assert_not_called()
+                self.assertNotIn(SECRET,errors.getvalue())
+
+    def test_public_startup_passes_exact_scope_and_parsed_limits_to_handler(self):
+        with TemporaryDirectory() as folder:
+            state=Path(folder)/'runtime'
+            values={'NHIS_STATE_DIR':str(state),'NHIS_HOST':'0.0.0.0','WEB_AUTH_SECRET':SECRET,
+                    'NHIS_PUBLIC_ACCESS':'true','NHIS_ALLOWED_HOSTS':'nhis.example',
+                    'NHIS_ALLOWED_ORIGINS':'https://nhis.example/',
+                    'NHIS_PUBLIC_MESSAGES_PER_HOUR':'7','NHIS_PUBLIC_MESSAGES_PER_DAY':'17',
+                    'NHIS_PUBLIC_CHATS_PER_HOUR':'3','NHIS_PUBLIC_CHATS_PER_DAY':'13'}
+            fixture=MagicMock();listener=MagicMock();listener.server_port=10000
+            with patch.dict(os.environ,values,clear=True),patch.object(server,'load_environment'), \
+                 patch('sys.argv',['server.py','--port','10000']),patch.object(engine,'Agent',return_value=fixture), \
+                 patch.object(server,'handler_for',return_value='PUBLIC_FIXTURE_HANDLER') as handler, \
+                 patch.object(server,'ThreadingHTTPServer',return_value=listener) as bind, \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                server.main()
+            handler.assert_called_once_with(fixture,allowed_hosts=['nhis.example'],
+                allowed_origins=['https://nhis.example'],auth_secret=SECRET,public_access=True,
+                public_limits={'messages_per_hour':7,'messages_per_day':17,
+                               'chats_per_hour':3,'chats_per_day':13})
+            bind.assert_called_once_with(('0.0.0.0',10000),'PUBLIC_FIXTURE_HANDLER')
+            listener.serve_forever.assert_called_once();listener.server_close.assert_called_once()
+            self.assertNotIn(SECRET,output.getvalue())
+
+    def test_remote_public_mode_rejects_any_http_origin_before_binding(self):
+        for origins in ('http://nhis.example','https://nhis.example,http://other.example'):
+            with self.subTest(origins=origins),TemporaryDirectory() as folder:
+                values={'NHIS_STATE_DIR':str(Path(folder)/'state'),'NHIS_PUBLIC_ACCESS':'true',
+                        'WEB_AUTH_SECRET':SECRET,'NHIS_ALLOWED_HOSTS':'nhis.example',
+                        'NHIS_ALLOWED_ORIGINS':origins}
+                with patch.dict(os.environ,values,clear=True),patch.object(server,'load_environment'), \
+                     patch('sys.argv',['server.py','--host','0.0.0.0']),patch.object(engine,'Agent'), \
+                     patch.object(server,'ThreadingHTTPServer') as listener,patch.object(server,'handler_for') as handler, \
+                     contextlib.redirect_stderr(io.StringIO()) as errors,self.assertRaises(SystemExit) as stopped:
+                    server.main()
+                self.assertEqual(stopped.exception.code,1)
+                self.assertIn('HTTPS',errors.getvalue())
+                listener.assert_not_called();handler.assert_not_called()
+
+    def test_public_startup_rejects_invalid_limits_before_binding(self):
+        for name in entrypoint.PUBLIC_LIMITS:
+            values={'NHIS_PUBLIC_ACCESS':'true','WEB_AUTH_SECRET':SECRET,name:'0'}
+            with self.subTest(name=name),TemporaryDirectory() as folder:
+                values['NHIS_STATE_DIR']=str(Path(folder)/'state')
+                with patch.dict(os.environ,values,clear=True),patch.object(server,'load_environment'), \
+                     patch('sys.argv',['server.py','--host','127.0.0.1']),patch.object(engine,'Agent'), \
+                     patch.object(server,'ThreadingHTTPServer') as listener,patch.object(server,'handler_for') as handler, \
+                     contextlib.redirect_stderr(io.StringIO()) as errors,self.assertRaises(SystemExit) as stopped:
+                    server.main()
+                self.assertEqual(stopped.exception.code,1)
+                self.assertIn(name,errors.getvalue())
+                listener.assert_not_called();handler.assert_not_called()
+
     def test_non_loopback_without_all_auth_requirements_never_binds(self):
         cases=[{}, {'WEB_AUTH_SECRET':'short','NHIS_ALLOWED_HOSTS':'nhis.example','NHIS_ALLOWED_ORIGINS':'https://nhis.example'},
                {'WEB_AUTH_SECRET':SECRET,'NHIS_ALLOWED_HOSTS':'nhis.example'},

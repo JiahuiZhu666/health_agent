@@ -14,17 +14,22 @@ class ConversationBusy(ValueError):
 
 
 class ChatJobs:
-    def __init__(self, service):
+    def __init__(self, service, *, capacity=None):
         self.service = service
         self._lock = threading.Lock()
         self._jobs = {}
         self._active = {}
+        self._capacity = capacity
+
+    def has_active(self):
+        with self._lock:
+            return bool(self._active)
 
     def active_job(self, conversation_id):
         with self._lock:
             return self._active.get(conversation_id)
 
-    def submit(self, conversation_id, text, measure_model=False, repeats=5, prompt_versions=3):
+    def submit(self, conversation_id, text, measure_model=False, repeats=5, prompt_versions=3, *, admission=None):
         if not isinstance(text, str) or not 1 <= len(text.strip()) <= 2000:
             raise ValueError('Enter a message of 1–2,000 characters.')
         if type(measure_model) is not bool or type(repeats) is not int or not 1 <= repeats <= 5 or type(prompt_versions) is not int or not 1 <= prompt_versions <= 3:
@@ -38,6 +43,8 @@ class ChatJobs:
                 raise ConversationBusy('The previous message in this conversation is still processing. Wait for the reply before continuing.')
             if len(self._active) >= 4:
                 raise ConversationBusy('This computer is processing other conversations. Try again shortly.')
+            if self._capacity is not None and not self._capacity.acquire(blocking=False):
+                raise ConversationBusy('The service is processing other conversations. Try again shortly.')
             # A disconnected tab can recover an existing job, but never duplicate it.
             self._jobs[job_id] = {'id':job_id, 'job_id':job_id, 'conversation_id':conversation_id,
                                   'status':'running', 'created_at':_now(), 'updated_at':_now(), 'events':[]}
@@ -51,6 +58,11 @@ class ChatJobs:
                 self._jobs[job_id]['updated_at'] = _now()
         def run():
             try:
+                if admission is not None and not admission.result():
+                    with self._lock:
+                        self._jobs[job_id].update(status='failed', updated_at=_now(),
+                            error='This message could not be admitted. No model request was started. Please try again later.')
+                    return
                 response = self.service.send(conversation_id, text.strip(), measure_model=measure_model,
                     repeats=repeats, prompt_versions=prompt_versions, on_event=observe)
                 with self._lock:
@@ -62,7 +74,17 @@ class ChatJobs:
             finally:
                 with self._lock:
                     self._active.pop(conversation_id, None)
-        threading.Thread(target=run, daemon=True, name='nhis-chat-' + job_id[:8]).start()
+                if self._capacity is not None:
+                    self._capacity.release()
+        try:
+            threading.Thread(target=run, daemon=True, name='nhis-chat-' + job_id[:8]).start()
+        except Exception:
+            with self._lock:
+                self._active.pop(conversation_id, None)
+                self._jobs.pop(job_id, None)
+            if self._capacity is not None:
+                self._capacity.release()
+            raise
         return {'id':job_id, 'job_id':job_id, 'conversation_id':conversation_id, 'status':'running'}
 
     def delete_conversation(self, conversation_id):
