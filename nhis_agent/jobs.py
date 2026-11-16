@@ -251,22 +251,26 @@ class ChatJobs:
                         pass
             finally:
                 stopped.set()
-                if pulse is not None:
-                    pulse.join(timeout=min(1,self.heartbeat_interval))
+                if pulse is not None and pulse.ident is not None:
+                    # This worker owns its heartbeat. Keep it registered until
+                    # both threads are quiescent; shutdown's outer timed join
+                    # still bounds the caller and reports pending work honestly.
+                    pulse.join()
                 self._capacity.release()
                 with self._lock:
                     self._threads.pop(job_id,None)
         thread = threading.Thread(target=execute,daemon=True,name='nhis-chat-'+job_id[:8])
         with self._lock:
             self._threads[job_id] = thread
-        try:
-            thread.start()
-        except BaseException:
-            with self._lock:
+            try:
+                # Shutdown snapshots this map under the same lock. It must
+                # never observe a Thread that cannot yet be joined.
+                thread.start()
+            except BaseException:
                 self._threads.pop(job_id,None)
-            if not capacity_reserved:
-                self._capacity.release()
-            raise
+                if not capacity_reserved:
+                    self._capacity.release()
+                raise
 
     @staticmethod
     def _compact_response(response):

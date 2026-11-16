@@ -6,6 +6,26 @@
   },
   "baseline_commit": "caa58255f96323b1d943165609d64c5e217977d9",
   "baseline_tag": "upgrade-baseline-caa5825",
+  "ci_cleanup_followup": {
+    "event_gated_lifecycle_stress_cases": 200,
+    "hosted_python_3_11_run": "pending_GitHub_Actions_rerun",
+    "old_fixture_mutation": "Detected with one expected failure and no cleanup errors.",
+    "old_shutdown_mutations": "Each event-gated regression detects its prior lifecycle fault.",
+    "public_duplicate_case_repetitions": 250,
+    "python": "3.9.6",
+    "python_passed": 562,
+    "python_skipped": 1,
+    "python_tests_run": 563,
+    "recorded_at": "2026-11-16T23:57:45.141036+00:00",
+    "reported_failure": "Concurrent test teardown removed SQLite state while a secondary coordinator still owned a writer.",
+    "source_sha256": {
+      "nhis_agent/jobs.py": "701b1b5ba2f27b4170ae106602dc8b4ee2d4c92adb85df10c4000d78f1d6462e",
+      "tests/test_durable_jobs.py": "e21a76107854806fc1bddc131d271e87423a8bfcc6fbf16e3f84aae9b6cd44b6",
+      "tests/test_job_shutdown.py": "7dfd45dd348beb7c7093f641f27724e8a4d19a053a99b9c6df95376135aca563"
+    },
+    "status": "passed_locally",
+    "system": "Darwin"
+  },
   "conversation_quality_followup": {
     "actual_nhis_age_outcomes": [
       "delayed_care_cost",

@@ -60,12 +60,23 @@ class DurableJobTests(unittest.TestCase):
         self.addCleanup(self.folder.cleanup)
         self.service=Service(Path(self.folder.name)/'workspace')
         self.store=JobStore(Path(self.folder.name)/'state')
-        self.jobs=ChatJobs(self.service,store=self.store)
+        self.coordinators=[]
         self.addCleanup(self.stop)
+        self.jobs=self.coordinator(self.service,store=self.store)
+
+    def coordinator(self,service=None,**options):
+        jobs=ChatJobs(self.service if service is None else service,**options)
+        self.coordinators.append(jobs)
+        return jobs
 
     def stop(self):
-        self.service.release.set()
-        self.jobs.shutdown(2)
+        # Any coordinator can win a concurrent admission. Release every service
+        # first, then join every owner before TemporaryDirectory removes SQLite.
+        for jobs in self.coordinators:
+            jobs.service.release.set()
+        reports=[jobs.shutdown(2) for jobs in reversed(self.coordinators)]
+        for report in reports:
+            self.assertTrue(report['drained'], 'Fixture workers are still writing: '+str(report['pending_jobs']))
 
     def finish(self,jobs,jid):
         deadline=time.monotonic()+3
@@ -96,7 +107,7 @@ class DurableJobTests(unittest.TestCase):
         self.service.release.set()
         submitted=self.jobs.submit(CID,'Hello',client_message_id=KEY)
         complete=self.finish(self.jobs,submitted['id'])
-        restored=ChatJobs(self.service,store=JobStore(self.store.state_root))
+        restored=self.coordinator(self.service,store=JobStore(self.store.state_root))
         repeated=restored.submit(CID,'Hello',client_message_id=KEY)
         self.assertEqual(repeated['id'],submitted['id'])
         self.assertTrue(repeated['idempotent'])
@@ -108,7 +119,7 @@ class DurableJobTests(unittest.TestCase):
         self.assertNotIn('conversation"',text)
 
     def test_concurrent_duplicate_submissions_across_coordinators_execute_once(self):
-        other=ChatJobs(self.service,store=JobStore(self.store.state_root))
+        other=self.coordinator(self.service,store=JobStore(self.store.state_root))
         gate=threading.Barrier(8)
         def submit(number):
             gate.wait(2)
@@ -174,7 +185,7 @@ class DurableJobTests(unittest.TestCase):
     def test_concurrent_public_duplicates_share_one_quota_event_and_one_job(self):
         access=PublicAccess('UNIT_SIGNING_MATERIAL_NOT_REAL_12345678901234567890',
                             state_dir=self.store.state_root,messages_per_day=1)
-        other=ChatJobs(self.service,store=self.store)
+        other=self.coordinator(self.service,store=self.store)
         gate=threading.Barrier(6)
         def submit(number):
             jobs=self.jobs if number%2 else other
@@ -200,9 +211,57 @@ class DurableJobTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM accepted_events WHERE kind='message'").fetchone()[0],1)
             self.assertEqual(connection.execute('SELECT COUNT(*) FROM jobs').fetchone()[0],1)
 
+    def test_cleanup_drains_a_secondary_owner_before_removing_its_state(self):
+        other=self.coordinator(self.service,store=self.store)
+        finish_entered=threading.Event()
+        allow_finish=threading.Event()
+        shutdown_entered=threading.Event()
+        cleanup_done=threading.Event()
+        errors=[]
+        original_finish=self.store.finish
+        original_shutdown=other.shutdown
+
+        def gated_finish(*args,**kwargs):
+            finish_entered.set()
+            if not allow_finish.wait(3):
+                raise AssertionError('The cleanup test did not release its final writer.')
+            return original_finish(*args,**kwargs)
+
+        def observed_shutdown(*args,**kwargs):
+            shutdown_entered.set()
+            return original_shutdown(*args,**kwargs)
+
+        def cleanup():
+            try:self.stop()
+            except BaseException as error:errors.append(error)
+            finally:cleanup_done.set()
+
+        with patch.object(self.store,'finish',side_effect=gated_finish), \
+             patch.object(other,'shutdown',side_effect=observed_shutdown):
+            other.submit(CID,'Hello',client_message_id=KEY)
+            self.assertTrue(self.service.started.wait(1))
+            thread=threading.Thread(target=cleanup)
+            thread.start()
+            try:
+                self.assertTrue(shutdown_entered.wait(1),'Cleanup did not join the secondary owner.')
+                self.assertTrue(finish_entered.wait(1))
+                self.assertFalse(cleanup_done.is_set(),'State cleanup passed an unfinished SQLite writer.')
+                self.assertTrue(Path(self.folder.name).is_dir())
+            finally:
+                allow_finish.set()
+                thread.join(3)
+                # Also drain on assertion failure, so the red regression itself
+                # cannot leave a writer racing TemporaryDirectory.cleanup.
+                original_shutdown(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors,[])
+            self.assertTrue(cleanup_done.is_set())
+        self.folder.cleanup()
+        self.assertFalse(Path(self.folder.name).exists())
+
     def test_saved_local_step_is_reused_only_after_explicit_recovery(self):
         row,_,_=self.seed(checkpoint=True)
-        restored=ChatJobs(self.service,store=self.store)
+        restored=self.coordinator(self.service,store=self.store)
         waiting=restored.get(row['job_id'])
         self.assertTrue(waiting['recovery_required'])
         self.assertTrue(waiting['can_resume'])
@@ -217,7 +276,7 @@ class DurableJobTests(unittest.TestCase):
 
     def test_unfinished_external_attempt_is_unknown_and_cannot_be_resent(self):
         row,_,_=self.seed(external=True)
-        restored=ChatJobs(self.service,store=self.store)
+        restored=self.coordinator(self.service,store=self.store)
         unknown=restored.get(row['job_id'])
         self.assertEqual(unknown['execution_state'],'unknown')
         self.assertTrue(unknown['recovery_required']);self.assertFalse(unknown['can_resume'])
@@ -230,7 +289,7 @@ class DurableJobTests(unittest.TestCase):
 
     def test_saved_provider_result_replays_without_a_new_attempt_or_reservation(self):
         row,_,_=self.seed(external=True,complete=True)
-        restored=ChatJobs(self.service,store=self.store)
+        restored=self.coordinator(self.service,store=self.store)
         def use_saved(ctx):
             result=ctx.external_cached('planned-call',{'request_hash':'fixed','reservation_id':'different-new-reservation'})
             self.assertEqual(result,{'status':'ok','content':'SAVED_PROVIDER_RESULT'})
@@ -246,7 +305,7 @@ class DurableJobTests(unittest.TestCase):
     def test_other_live_coordinator_does_not_reconcile_an_active_lease(self):
         submitted=self.jobs.submit(CID,'Hello',client_message_id=KEY)
         self.assertTrue(self.service.started.wait(1))
-        other=ChatJobs(self.service,store=self.store)
+        other=self.coordinator(self.service,store=self.store)
         self.assertEqual(other.get(submitted['id'])['execution_state'],'running')
         self.assertFalse(other.get(submitted['id'])['recovery_required'])
         self.assertEqual(self.service.calls,1)
@@ -298,7 +357,7 @@ class DurableJobTests(unittest.TestCase):
 
     def test_workspace_ownership_applies_to_get_cancel_and_recovery(self):
         submitted=self.jobs.submit(CID,'Hello',client_message_id=KEY)
-        other=ChatJobs(Service(Path(self.folder.name)/'other'),store=self.store)
+        other=self.coordinator(Service(Path(self.folder.name)/'other'),store=self.store)
         for action in (other.get,other.request_cancel,other.resume):
             with self.assertRaises(FileNotFoundError):action(submitted['id'])
         self.assertEqual(self.jobs.latest_job(CID)['client_message_id'],KEY)
@@ -377,7 +436,7 @@ class DurableJobTests(unittest.TestCase):
         row,_=self.store.create(self.jobs.workspace_id,CID,KEY,fingerprint(REQUEST),REQUEST)
         with self.store.transaction() as connection:
             connection.execute('UPDATE jobs SET owner_pid=0,lease_expires_at=0 WHERE job_id=?',(row['job_id'],))
-        restored=ChatJobs(self.service,store=self.store)
+        restored=self.coordinator(self.service,store=self.store)
         state=restored.get(row['job_id'])
         self.assertEqual(state['execution_state'],'queued')
         self.assertTrue(state['recovery_required']);self.assertTrue(state['can_resume'])
@@ -387,7 +446,7 @@ class DurableJobTests(unittest.TestCase):
         self.assertEqual(self.finish(restored,row['job_id'])['execution_state'],'succeeded')
 
     def test_heartbeat_renews_the_persisted_worker_lease(self):
-        jobs=ChatJobs(self.service,store=self.store,lease_seconds=1,heartbeat_interval=.02)
+        jobs=self.coordinator(self.service,store=self.store,lease_seconds=1,heartbeat_interval=.02)
         submitted=jobs.submit(CID,'Hello',client_message_id=KEY)
         self.assertTrue(self.service.started.wait(1))
         first=self.store.get(jobs.workspace_id,submitted['id'])['lease_expires_at']
@@ -401,7 +460,7 @@ class DurableJobTests(unittest.TestCase):
         try:
             for number in range(5):
                 service=Service(Path(self.folder.name)/('visitor-'+str(number)))
-                jobs=ChatJobs(service,store=JobStore(self.store.state_root))
+                jobs=self.coordinator(service,store=JobStore(self.store.state_root))
                 coordinators.append((service,jobs))
                 if number<4:
                     jobs.submit(CID,'Hello',client_message_id=KEY)
@@ -417,7 +476,7 @@ class DurableJobTests(unittest.TestCase):
     def test_failed_external_result_is_preserved_as_that_attempt_not_replaced_by_success(self):
         row,ctx,attempt=self.seed(external=True)
         ctx.external_finish(attempt,{'status':'failed','error_code':'refused','content':''})
-        restored=ChatJobs(self.service,store=self.store)
+        restored=self.coordinator(self.service,store=self.store)
         def retain_failure(context):
             saved=context.external_cached('planned-call',{'request_hash':'fixed'})
             self.assertEqual(saved['error_code'],'refused')
