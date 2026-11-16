@@ -86,6 +86,7 @@ class PublicAccess:
     def _connect(self):
         connection = sqlite3.connect(str(self.db_path),timeout=2,isolation_level=None)
         connection.execute('PRAGMA busy_timeout=2000')
+        connection.execute('PRAGMA foreign_keys=ON')
         return connection
 
     def _now(self):
@@ -131,7 +132,7 @@ class PublicAccess:
             cookie['secure'] = True
         return visitor_id,cookie.OutputString()
 
-    def reserve(self, visitor_id, kind='message', accept=None):
+    def reserve(self, visitor_id, kind='message', accept=None, *, lookup=None, accept_transaction=None):
         """Atomically check visitor/hour + global/day limits and charge admission.
 
         ``messages_per_day`` and ``chats_per_day`` are global limits, shared by
@@ -145,11 +146,20 @@ class PublicAccess:
             raise ValueError('The public reservation kind must be message or create.')
         if accept is not None and not callable(accept):
             raise ValueError('The admission callback must be callable.')
+        if lookup is not None and not callable(lookup):
+            raise ValueError('The duplicate lookup must be callable.')
+        if accept_transaction is not None and not callable(accept_transaction):
+            raise ValueError('The transactional admission callback must be callable.')
         now = self._now()
         visitor_limit,global_limit = self.limits[kind]
         connection = self._connect()
         try:
             connection.execute('BEGIN IMMEDIATE')
+            if lookup is not None:
+                original = lookup(connection)
+                if original is not None:
+                    connection.commit()
+                    return {'allowed':True,'retry_after':0,'status':'accepted','idempotent':True,'value':original}
             connection.execute('DELETE FROM accepted_events WHERE accepted_at <= ?', (now-_DAY,))
             visitor_rows = connection.execute(
                 'SELECT accepted_at FROM accepted_events WHERE visitor=? AND kind=? AND accepted_at>? ORDER BY accepted_at',
@@ -169,10 +179,10 @@ class PublicAccess:
                         'message':'Too many requests. Try again after the indicated delay.'}
             connection.execute('INSERT INTO accepted_events(visitor,kind,accepted_at) VALUES (?,?,?)',
                                (visitor_id,kind,now))
-            value = accept() if accept is not None else None
+            value = accept_transaction(connection) if accept_transaction is not None else accept() if accept is not None else None
             connection.commit()
             result = {'allowed':True,'retry_after':0,'status':'accepted'}
-            if accept is not None:
+            if accept is not None or accept_transaction is not None:
                 result['value'] = value
             return result
         except BaseException:

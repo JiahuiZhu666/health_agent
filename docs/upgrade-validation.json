@@ -1,0 +1,111 @@
+{
+  "baseline_checks": {
+    "javascript_checks": 41,
+    "python_tests": 353,
+    "status": "passed"
+  },
+  "baseline_commit": "caa58255f96323b1d943165609d64c5e217977d9",
+  "baseline_tag": "upgrade-baseline-caa5825",
+  "execution_environment": {
+    "python": "3.9.6",
+    "system": "Darwin"
+  },
+  "external_gates": {
+    "actual_github_actions_run": "pending",
+    "chromium_browser_scenarios": "pending_registry_dns_and_browser_unavailable",
+    "committed_npm_lockfile": "pending_registry_access",
+    "container_build_and_smoke": "pending_no_local_docker",
+    "definition_matched_external_benchmark": "pending",
+    "github_push": "attempted_failed_dns_github_com",
+    "github_required_status_branch_protection": "pending_remote_configuration",
+    "independent_stata": "pending",
+    "live_provider": "not_run_no_paid_requests_for_upgrade",
+    "online_deployment": "not_updated_by_this_upgrade",
+    "reviewed_immutable_base_digest": "pending_registry_access",
+    "target_host_alerting_and_tls": "pending"
+  },
+  "local_checks": {
+    "concurrency_regressions": {
+      "historical_lock_order_mutation": "all three fail as expected without source mutation",
+      "status": "passed",
+      "tests": 3
+    },
+    "javascript": {
+      "checks": 66,
+      "real_browser": false,
+      "status": "passed"
+    },
+    "python": {
+      "passed": 509,
+      "skip_reason": "Linux-only address-space enforcement test; local host is macOS.",
+      "skipped": 1,
+      "status": "passed",
+      "tests_run": 510
+    },
+    "semantic_cases": 66
+  },
+  "official_nhis_baseline_regression": {
+    "cases": [
+      {
+        "name": "education_original",
+        "numerical_checks": 397,
+        "warnings": []
+      },
+      {
+        "name": "uninsured_income_gradient",
+        "numerical_checks": 415,
+        "warnings": []
+      },
+      {
+        "name": "delayed_care_overall",
+        "numerical_checks": 331,
+        "warnings": []
+      }
+    ],
+    "data_sha256": {
+      "adult": "31c5be8d630c13f6d0a232831a79654de7038d97fc4f33d803d8d2c84705c9d5",
+      "income": "1758efde4e666ec1dcb1500f7166ce41fff50ec0fcb1797c8cba648bb0c1530b"
+    },
+    "independent_stata": "pending",
+    "report_sha256": "3f1151c1f2467ed150f92554cbc09c18aec2823c26038ba80fdb2043497b3b3c",
+    "runtime": {
+      "jsonlite_version": "2.0.0",
+      "mitools_version": "2.4",
+      "r_version": "4.5.3",
+      "survey_version": "4.5"
+    },
+    "source_sha256": {
+      "config/registry.json": "81ee5f3efe79bc6f98ee0357473769f990fa36c7e9e2ee89b351ccdd6489da55",
+      "nhis_agent/r_worker.py": "5778d5e9ae9b8ee797e620e47673e79c5e9f3cbdb63873b1e917449a4e77d127",
+      "nhis_agent/stats.py": "61ac09a237b858c625acd11197dcd69fc9ac2e6fe90de099b91d870538ff12bc",
+      "scripts/analyze.R": "907a7172cbcee657827acdeedb06c1cfebbb71087c5ce21e496442f6738adfa1"
+    },
+    "status": "ok"
+  },
+  "recorded_at": "2026-11-16T22:49:26.860573+00:00",
+  "schema_version": 1,
+  "scope": "Local implementation evidence; external release gates are listed separately.",
+  "state_recovery": {
+    "conversations": 2,
+    "files": 213,
+    "original_state_modified": false,
+    "secrets_or_official_csv_in_backup": false,
+    "sqlite_online_snapshot_scenarios": "separate temporary-fixture tests passed",
+    "status": "ok"
+  },
+  "synthetic_real_r": {
+    "cases": 10,
+    "numerical_checks": 499,
+    "production_fallback": false,
+    "report_sha256": "adc3df67432cd3a522e2d201354d15e800f8aac8d868dc1bfcc5de8ddf6124b1",
+    "source_sha256": {
+      "expected_metadata": "2f64688064d652588c74380859dbc3c22ae332a2662ee19c8a42dfcdb648ad80",
+      "generator": "50fff78ee0ad02def270a6438864b82365403cdb5c2c41d5b4545327f717fb65",
+      "production_r": "907a7172cbcee657827acdeedb06c1cfebbb71087c5ce21e496442f6738adfa1",
+      "reference_r": "ad5034d6350b7ed86942957c8b1060af348e84f2684d00e55532bdd919d700b1",
+      "registry": "81ee5f3efe79bc6f98ee0357473769f990fa36c7e9e2ee89b351ccdd6489da55",
+      "validator": "7c328927a1b4e1f2449b18a8a83ea87d8c5b19ad7233160917edb0d464ab4e7b"
+    },
+    "status": "ok"
+  }
+}

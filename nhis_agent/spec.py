@@ -55,7 +55,7 @@ def requested_outcomes(question):
     return list(dict.fromkeys(selected))
 
 
-def route(question):
+def _route_registered(question):
     if not isinstance(question, str) or not question.strip():
         return {'status': 'clarify', 'answer': 'Enter a research question, such as “Compare fair/poor self-rated health by education among adults aged 25–64.”'}
     if len(question) > 2000:
@@ -167,4 +167,29 @@ def route(question):
     result = {'status': 'ready', 'spec': spec, 'spec_hash': fingerprint(spec)}
     if len(outcomes)>1:
         result['outcomes'] = outcomes
+    return result
+
+
+def route(question):
+    """Audit explicit constraints before compiling a registered specification."""
+    from .intent import inspect_intent
+    intent = inspect_intent(question)
+    result = _route_registered(question)
+    result['intent'] = intent.document()
+    if result.get('status')=='blocked':
+        return result
+    if intent.resolution!='ready':
+        return {'status':'clarify','answer':intent.clarification(),'intent':intent.document()}
+    if result.get('status')=='ready' and intent.operations:
+        candidate = dict(result['spec'],filters=dict(result['spec'].get('filters',{})))
+        for operation in intent.operations:
+            if operation.operator=='exclude':
+                # The legacy positive-category extractor sees a mention but
+                # cannot decide inclusion/exclusion. The typed patch owns that.
+                candidate['filters'].pop(operation.field,None)
+        try:
+            result['spec'] = intent.patch.apply(candidate)
+        except ValueError as error:
+            return {'status':'clarify','answer':str(error),'intent':intent.document()}
+        result['spec_hash'] = fingerprint(result['spec'])
     return result

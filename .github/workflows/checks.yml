@@ -4,25 +4,24 @@ on:
   push:
   pull_request:
   workflow_dispatch:
-    inputs:
-      build_container:
-        description: Build the production container without data or API calls
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
 
+env:
+  OPENAI_API_KEY: ""
+  NHIS_MODEL_NAME: ""
+  NHIS_AUTO_DOWNLOAD_DATA: "false"
+  NHIS_PUBLIC_ACCESS: "false"
+
 jobs:
   checks:
-    # Python 3.9 has no setup-python build for Ubuntu 26.04.
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.9", "3.11"]
-    env:
-      OPENAI_API_KEY: ""
     steps:
       - uses: actions/checkout@v6
         with:
@@ -33,9 +32,9 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
-      - name: Isolated Python tests (no R, data download or live model calls)
+      - name: Isolated Python and versioned intent tests (no paid models or NHIS download)
         run: python -m unittest discover -s tests -q
-      - name: Browser JavaScript checks
+      - name: Offline browser JavaScript contracts
         run: |
           node --check web/app.js
           node tests/test_web_english.js
@@ -43,13 +42,160 @@ jobs:
           node tests/test_web_deletion.js
           node tests/test_web_public.js
           node tests/test_web_charts.js
+          node tests/test_web_turns.js
+          node tests/test_web_pagination.js
 
-  container:
-    if: github.event_name == 'workflow_dispatch' && inputs.build_container
-    runs-on: ubuntu-latest
+  r-fixture:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    container: python:3.11.18-slim-bookworm
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Build image (OS packages only; no data or credentials)
-        run: docker build --pull --tag nhis-lab:ci .
+      - name: Install verified direct R package versions
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends r-base-core=4.2.2.20221110-2 r-cran-survey=4.1-1-1 r-cran-jsonlite=1.8.4+dfsg-1 r-cran-mitools=2.4-2
+          mkdir -p artifacts
+          dpkg-query -W > artifacts/r-fixture-debian-packages.tsv
+      - name: Required real-R statistical fixture (fails when R is absent)
+        run: |
+          python scripts/validate_fixture.py --rscript /usr/bin/Rscript --output artifacts/r-fixture-validation.json > artifacts/r-fixture-stdout.json
+          python -c 'import json; r=json.load(open("artifacts/r-fixture-validation.json")); assert r["status"]=="ok" and r["test_only"] is True and r["production_fallback"] is False; print(r["case_count"], "synthetic cases;", r["passed_checks"], "checks passed; independent Stata remains", r["independent_stata_validation"]["status"])'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: real-r-fixture-evidence
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+  browser:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install exact declared Playwright dependency and record actual resolution
+        run: |
+          mkdir -p artifacts
+          if test -f package-lock.json; then
+            npm ci --ignore-scripts --no-audit --no-fund
+          else
+            # No lock is invented offline: this networked job produces actual integrity metadata.
+            npm install --ignore-scripts --no-audit --no-fund
+          fi
+          node -e 'const p=require("./node_modules/@playwright/test/package.json"); if(p.version!=="1.65.1") throw Error("Unexpected browser runner version")'
+          cp package-lock.json artifacts/npm-package-lock.resolved.json
+          npm ls --all --json > artifacts/npm-resolved-tree.json
+          node --version > artifacts/node-version.txt
+      - name: Install Chromium matched to the exact Playwright release
+        run: npx --no-install playwright install --with-deps chromium
+      - name: Actual Chromium UI flows over isolated fixture transport (no live API/data)
+        run: npm run test:browser -- --project=chromium --retries=0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-fixture-evidence
+          path: |
+            artifacts/
+            test-results/
+            playwright-report/
+          if-no-files-found: warn
+          retention-days: 14
+
+  container:
+    # Required on every push/PR; container validation is no longer opt-in.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      DOCKER_BUILDKIT: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Resolve official Python tag to an immutable digest for this build
+        run: |
+          mkdir -p artifacts
+          docker pull python:3.11.18-slim-bookworm
+          NHIS_BASE_REF=$(docker image inspect --format '{{index .RepoDigests 0}}' python:3.11.18-slim-bookworm)
+          test -n "$NHIS_BASE_REF"
+          case "$NHIS_BASE_REF" in python@sha256:*|docker.io/library/python@sha256:*) ;; *) exit 1 ;; esac
+          printf '%s\n' "$NHIS_BASE_REF" > artifacts/python-base-ref.txt
+      - name: Build mandatory real-R validation and separate runtime allowlist
+        run: |
+          NHIS_BASE_REF=$(cat artifacts/python-base-ref.txt)
+          docker build --build-arg PYTHON_BASE="$NHIS_BASE_REF" --target validation --tag nhis-lab:validation .
+          docker build --build-arg PYTHON_BASE="$NHIS_BASE_REF" --target runtime --tag nhis-lab:ci .
+          docker image inspect nhis-lab:ci > artifacts/container-image.json
+          NHIS_EVIDENCE_CONTAINER=$(docker create nhis-lab:ci)
+          docker cp "$NHIS_EVIDENCE_CONTAINER:/usr/share/nhis-provenance" artifacts/container-provenance
+          docker rm "$NHIS_EVIDENCE_CONTAINER"
+          docker run --rm --entrypoint python nhis-lab:ci -c 'import json,pathlib; p=pathlib.Path("/app"); assert not any((p/n).exists() for n in ("tests","data",".env",".venv","node_modules","package.json")); r=json.loads(pathlib.Path("/usr/share/nhis-provenance/fixture-validation.json").read_text()); assert r["status"]=="ok" and r["test_only"] is True and r["production_fallback"] is False; print(r["case_count"],"container synthetic R cases passed")'
+      - name: Start resource-bounded container with no model key or survey download
+        run: |
+          docker run --detach --name nhis-smoke --publish 127.0.0.1:10000:10000 \
+            --memory 1g --memory-swap 1g --cpus 2 --pids-limit 128 --read-only \
+            --tmpfs /tmp:rw,nosuid,noexec,size=256m \
+            --tmpfs /var/lib/nhis:rw,nosuid,noexec,size=128m,mode=0700 \
+            --security-opt no-new-privileges --cap-drop ALL --cap-add CHOWN --cap-add SETUID --cap-add SETGID \
+            --env WEB_AUTH_SECRET=ci-smoke-inert-local-password-0123456789 \
+            --env NHIS_ALLOWED_HOSTS=127.0.0.1:10000 \
+            --env NHIS_ALLOWED_ORIGINS=http://127.0.0.1:10000 \
+            --env OPENAI_API_KEY= --env NHIS_MODEL_NAME= --env NHIS_AUTO_DOWNLOAD_DATA=false nhis-lab:ci
+      - name: Verify liveness, auth, real R capability and honest unavailable-data status
+        run: |
+          python - <<'PY'
+          import base64,json,time,urllib.error,urllib.request
+          base='http://127.0.0.1:10000'
+          for attempt in range(60):
+              try:
+                  with urllib.request.urlopen(base+'/healthz',timeout=1) as response:
+                      assert json.load(response)['status']=='ok'
+                  break
+              except (OSError,ValueError,AssertionError):
+                  if attempt==59: raise
+                  time.sleep(.5)
+          try:
+              urllib.request.urlopen(base+'/api/status',timeout=5)
+              raise AssertionError('Private API was accessible without authentication')
+          except urllib.error.HTTPError as error:
+              assert error.code==401
+          authorization=base64.b64encode(b'owner:ci-smoke-inert-local-password-0123456789').decode()
+          request=urllib.request.Request(base+'/api/status',headers={'Authorization':'Basic '+authorization})
+          # Statistics readiness is an asynchronous observed local probe. Poll
+          # its snapshot without sending any model request or starting R work.
+          deadline=time.monotonic()+40
+          while True:
+              remaining=deadline-time.monotonic()
+              if remaining<=0:raise AssertionError('Observed statistics readiness did not settle within 40 seconds')
+              with urllib.request.urlopen(request,timeout=min(5,remaining)) as response: state=json.load(response)
+              if state['statistics'].get('ready') is True:break
+              time.sleep(min(.5,max(0,deadline-time.monotonic())))
+          assert state['statistics']['ready'] is True, state['statistics']
+          assert state['data']['ready'] is False
+          assert state['dialogue']['configured'] is False
+          print('Liveness, authentication, R packages and unavailable-data/model status verified.')
+          PY
+          docker exec nhis-smoke python -c 'from pathlib import Path; s=Path("/proc/1/status").read_text(); u=next(x for x in s.splitlines() if x.startswith("Uid:")); assert int(u.split()[1])==10001; print("Application runs as UID 10001")'
+      - name: Verify graceful SIGTERM shutdown
+        run: |
+          docker stop --time 15 nhis-smoke
+          test "$(docker inspect --format '{{.State.ExitCode}}' nhis-smoke)" = 0
+      - name: Save safe smoke logs and remove the isolated container
+        if: always()
+        run: |
+          docker logs nhis-smoke > artifacts/container-smoke.log 2>&1 || true
+          docker rm --force nhis-smoke >/dev/null 2>&1 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: container-fixture-and-smoke-evidence
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14

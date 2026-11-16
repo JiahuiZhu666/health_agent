@@ -155,7 +155,7 @@ Public usage defaults to 20 messages per visitor per rolling hour and 200 messag
 
 The preview uses temporary storage and is not a validated full-scale research host. History, visitor state, official data and usage counters can be lost on restart or redeploy; a browser cookie alone cannot preserve them. Optional paid memory and persistent storage require a separate explicit choice. See [deployment instructions](deploy/README.md) for configuration and limitations. A prepared Blueprint is not a live chat URL.
 
-Hosted startup uses `NHIS_HOST`, `NHIS_STATE_DIR`, `NHIS_ALLOWED_HOSTS`, `NHIS_ALLOWED_ORIGINS`, and `WEB_AUTH_SECRET`. Non-loopback binding is refused without exact allowed origins and the required server secret. `NHIS_PUBLIC_ACCESS` accepts only `true` or `false` and defaults to `false` locally. Private hosted mode (`false`) uses HTTP Basic authentication with username `owner` and the secret as its password. `/healthz` is a liveness probe; `/readyz` checks model configuration only and does not test a live reply. The default local launch remains loopback-only.
+Hosted startup uses `NHIS_HOST`, `NHIS_STATE_DIR`, `NHIS_ALLOWED_HOSTS`, `NHIS_ALLOWED_ORIGINS`, and `WEB_AUTH_SECRET`. Non-loopback binding is refused without exact allowed origins and the required server secret. `NHIS_PUBLIC_ACCESS` accepts only `true` or `false` and defaults to `false` locally. Private hosted mode (`false`) uses HTTP Basic authentication with username `owner` and the secret as its password. `/healthz` is a liveness probe; `/readyz` reports chat configuration, last observed model status and cached statistical capability without sending a model request. The default local launch remains loopback-only.
 
 ## Verification
 
@@ -171,6 +171,11 @@ node tests/test_web_markdown.js
 node tests/test_web_deletion.js
 node tests/test_web_public.js
 node tests/test_web_charts.js
+node tests/test_web_turns.js
+node tests/test_web_pagination.js
+python3 scripts/validate_fixture.py --output artifacts/fixture-validation.json
 ```
 
 The independent Stata reference is `scripts/reference.do` and requires a licensed Stata installation. Its presence is not evidence that numerical agreement has been verified.
+
+Industrial upgrade: see [implementation and operator guide](docs/upgrade-implementation.md), [roadmap status](docs/industrial-agent-upgrade-roadmap.md), and [local validation record](docs/upgrade-validation.json). Durable chat jobs, idempotent submissions, explicit recovery/cancellation, bounded model/R execution, budget controls and paginated history are implemented. Container/Chromium, independent Stata, live-provider and target-deployment gates remain pending until actually executed.

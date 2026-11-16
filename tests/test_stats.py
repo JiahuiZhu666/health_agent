@@ -67,13 +67,14 @@ class SpecificationTests(unittest.TestCase):
             executable.chmod(0o755)
             completed = subprocess.CompletedProcess([], 0, "4.5.0\n4.4-2\n2.0.0\n2.4", "")
             with patch.object(stats, "ROOT", root), patch.object(stats.shutil, "which", return_value="/old/Rscript"), \
-                    patch.object(stats.subprocess, "run", return_value=completed) as process:
-                result = stats.readiness()
+                    patch.object(stats.r_worker, "run_probe", return_value=completed) as process:
+                result = stats.readiness(force=True)
             self.assertTrue(result["ready"])
-            self.assertEqual(result["rscript"], str(executable))
+            self.assertEqual(result["rscript"], str(executable.resolve()))
             self.assertEqual(result["mitools_version"], "2.4")
-            self.assertEqual(process.call_args[0][0][0], str(executable))
-            self.assertIn("sep=intToUtf8(10)", process.call_args[0][0][-1])
+            self.assertEqual(process.call_args[0][0], str(executable.resolve()))
+            self.assertIn("sep=intToUtf8(10)", stats.r_worker.PROBE_EXPRESSION)
+            stats.clear_readiness_cache()
 
 
 class DataPreflightTests(unittest.TestCase):

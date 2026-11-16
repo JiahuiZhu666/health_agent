@@ -1,0 +1,74 @@
+{
+  "age_domain_n": 5031,
+  "fixture_only": true,
+  "full_design_df": 50,
+  "full_sample_n": 8000,
+  "income_imputations": 10,
+  "outcomes": {
+    "delayed_care_cost": {
+      "missing_outcome_n": 130,
+      "negative_codes": [
+        2
+      ],
+      "positive_codes": [
+        1
+      ],
+      "valid_outcome_n": 4901,
+      "variable": "MEDDL12M_A",
+      "weighted_proportion": 0.3240910270247586
+    },
+    "fair_poor": {
+      "missing_outcome_n": 118,
+      "negative_codes": [
+        1,
+        2,
+        3
+      ],
+      "positive_codes": [
+        4,
+        5
+      ],
+      "valid_outcome_n": 4913,
+      "variable": "PHSTAT_A",
+      "weighted_proportion": 0.42550745507104243
+    },
+    "insured": {
+      "missing_outcome_n": 132,
+      "negative_codes": [
+        1
+      ],
+      "positive_codes": [
+        2
+      ],
+      "valid_outcome_n": 4899,
+      "variable": "NOTCOV_A",
+      "weighted_proportion": 0.6357067084381256
+    },
+    "uninsured": {
+      "missing_outcome_n": 132,
+      "negative_codes": [
+        2
+      ],
+      "positive_codes": [
+        1
+      ],
+      "valid_outcome_n": 4899,
+      "variable": "NOTCOV_A",
+      "weighted_proportion": 0.3642932915618723
+    },
+    "unmet_care_cost": {
+      "missing_outcome_n": 105,
+      "negative_codes": [
+        2
+      ],
+      "positive_codes": [
+        1
+      ],
+      "valid_outcome_n": 4926,
+      "variable": "MEDNG12M_A",
+      "weighted_proportion": 0.2596666367589783
+    }
+  },
+  "seed": 20261116,
+  "strata": 50
+}

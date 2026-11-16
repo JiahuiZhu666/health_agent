@@ -14,6 +14,14 @@
 !scripts/
 !scripts/analyze.R
 !scripts/reference.do
+!scripts/state_admin.py
+!scripts/model_admin.py
+!scripts/validate_fixture.py
+!tests/
+!tests/fixtures/
+!tests/fixtures/generate_survey.py
+!tests/fixtures/reference_survey.R
+!tests/fixtures/expected_metadata.json
 !deploy/
 !deploy/entrypoint.py
 
@@ -37,3 +45,10 @@ visitors/
 *.zip
 *.csv
 *.pdf
+node_modules/
+test-results/
+playwright-report/
+artifacts/
+backups/
+upgrades/
+previews/

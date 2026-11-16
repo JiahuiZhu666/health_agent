@@ -14,6 +14,7 @@ import re
 import stat
 import threading
 import uuid
+import weakref
 
 from .spec import route, VERSION, GROUPS, requested_outcomes
 from .stats import _normalise_spec
@@ -22,11 +23,14 @@ from .explanations import build_explanation
 from .jobs import ConversationBusy
 from .charts import chart_request, make_charts
 from .outcomes import get_outcome, allowed_outcomes
+from .intent import inspect_intent
+from .execution_context import current as current_execution
+from .storage_policy import StoragePolicy, ConversationIndex
 
 _CONVERSATION_ID = re.compile(r'[a-f0-9]{32}')
 _RUN_ID = re.compile(r'[0-9]{8}T[0-9]{6}Z-[a-f0-9]{10}')
 _SECRET = re.compile(r'\bsk-[A-Za-z0-9_-]{12,}')
-_CONVERSATION_LOCKS = {}
+_CONVERSATION_LOCKS = weakref.WeakValueDictionary()
 _CONVERSATION_LOCKS_GUARD = threading.Lock()
 _GROUP_PATTERNS = {
     'education_race': r'(?:教育.{0,8}(?:族裔|种族)|(?:族裔|种族).{0,8}教育).{0,6}(?:交叉|分组)|education.{0,8}race',
@@ -295,11 +299,13 @@ def _batch_request(text, context, messages):
 class ConversationService:
     def __init__(self, agent):
         self.agent = agent
-        self.root = Path(agent.root)
+        self.root = Path(agent.root).resolve()
         self.directory = self.root / 'conversations'
         self.directory.mkdir(parents=True, exist_ok=True)
         self._locks = _CONVERSATION_LOCKS
         self._locks_guard = _CONVERSATION_LOCKS_GUARD
+        self.storage = StoragePolicy(self.root)
+        self.index = ConversationIndex(self.root)
 
     def _path(self, conversation_id):
         if not isinstance(conversation_id, str) or not _CONVERSATION_ID.fullmatch(conversation_id):
@@ -384,6 +390,7 @@ class ConversationService:
                 if self._regular_conversation(conversation_id, directory_descriptor):
                     os.unlink(self._path(conversation_id).name, dir_fd=directory_descriptor)
                     deleted.append(conversation_id)
+                self.index.remove(deleted)
                 return {'deleted':deleted, 'deleted_count':len(deleted)}
             finally:
                 if file_descriptor is not None:
@@ -412,6 +419,7 @@ class ConversationService:
                     if self._regular_conversation(conversation_id, directory_descriptor):
                         os.unlink(self._path(conversation_id).name, dir_fd=directory_descriptor)
                         deleted.append(conversation_id)
+                self.index.remove(deleted)
                 return {'deleted':deleted, 'deleted_count':len(deleted)}
             finally:
                 for lock, file_descriptor in reversed(held):
@@ -423,21 +431,38 @@ class ConversationService:
         path = self._path(conversation_id)
         if path.is_symlink() or not path.is_file():
             raise FileNotFoundError('Conversation not found.')
+        if path.stat().st_size>self.storage.conversation_bytes:
+            raise ValueError('The saved conversation exceeds its storage limit.')
         try:
             value = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, ValueError, UnicodeError):
             raise ValueError('The saved conversation could not be read.')
         if not isinstance(value, dict) or value.get('id') != conversation_id or not isinstance(value.get('messages'), list):
             raise ValueError('The saved conversation has an invalid format.')
+        if value.get('schema_version',1) not in (1,2):
+            raise ValueError('This conversation schema version is not supported.')
         return value
 
     def _save(self, conversation):
         path = self._path(conversation['id'])
         temporary = path.with_suffix('.' + uuid.uuid4().hex + '.tmp')
+        conversation.setdefault('schema_version',2)
+        payload=json.dumps(conversation,ensure_ascii=False,indent=2,allow_nan=False).encode('utf-8')
         try:
-            temporary.write_text(json.dumps(conversation, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
-            temporary.chmod(0o600)
-            temporary.replace(path)
+            with self.storage.write_guard():
+                self.storage.check_conversation_write(path,len(payload))
+                descriptor=os.open(str(temporary),os.O_CREAT|os.O_EXCL|os.O_WRONLY|getattr(os,'O_NOFOLLOW',0),0o600)
+                with os.fdopen(descriptor,'wb') as stream:
+                    stream.write(payload);stream.flush();os.fsync(stream.fileno())
+                temporary.replace(path)
+                # JSON is authoritative. A derived-index failure must not turn
+                # an already saved answer into a failed, potentially paid turn.
+                try:
+                    self.index.record(conversation,path)
+                except Exception as error:
+                    from .telemetry import log_error
+                    try:log_error(self.root,'conversation.index_failed',error)
+                    except Exception:pass
         finally:
             if temporary.exists():
                 temporary.unlink()
@@ -528,7 +553,11 @@ class ConversationService:
                                              prompt_versions=prompt_versions,on_progress=emit)
             if not isinstance(result, dict) or result.get('status') not in ('ok','blocked','clarify'):
                 raise ValueError('Unexpected analysis response')
-        except Exception:
+        except Exception as error:
+            from .telemetry import log_error
+            execution=current_execution()
+            try:log_error(self.root,'conversation.analysis_failed',error,execution.identifiers() if execution else {})
+            except Exception:pass
             emit({'stage':'analysis','label':'Statistical execution did not finish','status':'failed',
                   'detail':'The analysis service failed. The unsuccessful specification was not made the basis for later follow-ups.'})
             return None, 'The analysis did not finish and no new statistical result was published. The previous successful scope is still saved.', 'blocked', None
@@ -624,20 +653,42 @@ class ConversationService:
         return self._public(value)
 
     def list(self):
-        values = []
-        for path in self.directory.glob('*.json'):
-            if not _CONVERSATION_ID.fullmatch(path.stem):
-                continue
-            try:
-                value = self._load(path.stem)
-            except (ValueError, FileNotFoundError):
-                continue
-            values.append({k: value.get(k) for k in ('id', 'title', 'created_at', 'updated_at', 'last_run_id')})
-            values[-1]['message_count'] = len(value['messages'])
-        return sorted(values, key=lambda item: item.get('updated_at') or '', reverse=True)
+        self.index.ensure()
+        return self.index.all_summaries()
 
-    def get(self, conversation_id):
-        return self._public(self._load(conversation_id))
+    def page(self,limit=30,cursor=None):
+        self.index.ensure()
+        return self.index.page(limit=limit,cursor=cursor)
+
+    def get(self, conversation_id, *, limit=None, before=None):
+        value=self._public(self._load(conversation_id))
+        if limit is not None:
+            if type(limit) is not int or not 1<=limit<=100:
+                raise ValueError('The message page limit must be between 1 and 100.')
+            messages=value['messages'];end=len(messages)
+            if before is not None:
+                if not isinstance(before,str) or not _CONVERSATION_ID.fullmatch(before):
+                    raise ValueError('The message cursor is invalid.')
+                matches=[index for index,item in enumerate(messages) if item.get('id')==before]
+                if not matches:raise ValueError('The message cursor does not exist in this conversation.')
+                end=matches[0]
+            start=max(0,end-limit)
+            value['messages']=messages[start:end]
+            value['pagination']={'total':len(messages),'has_more':start>0,
+                'before':messages[start].get('id') if start<end else None}
+        return value
+
+    def get_for_job(self,conversation_id):
+        return self.get(conversation_id,limit=50)
+
+    def completed_turn(self,conversation_id,turn_id):
+        """Read committed evidence before considering new execution controls."""
+        conversation=self._load(conversation_id)
+        completed=next((item for item in conversation['messages'] if item.get('role')=='assistant'
+                        and item.get('turn_id')==turn_id),None)
+        if completed is None:return None
+        return {'conversation_id':conversation_id,'conversation':self._public(conversation),
+                'message':copy.deepcopy(completed),'result':self._run(completed.get('run_id'))}
 
     def _explain(self, text, current, previous):
         detailed = build_explanation(text, current, previous)
@@ -700,6 +751,30 @@ class ConversationService:
         return analysis_reply(current, current.get('spec') or _DEFAULT_SPEC, question=text), 'explanation'
 
     def _resolve(self, text, conversation, routed):
+        intent = inspect_intent(text)
+        if intent.resolution!='ready':
+            return None,None
+        spec,pending = self._resolve_legacy(text,conversation,routed)
+        if any(operation.operator=='exclude' for operation in intent.operations):
+            existing = (conversation.get('context') or {}).get('spec')
+            if intent.followup and existing:
+                # Apply exclusion to the actual active domain, never broaden a
+                # female-only domain into men because a keyword mentioned women.
+                base = copy.deepcopy(existing)
+                if spec and _chart_groups(text):
+                    base['group_by'] = spec['group_by']
+                explicit = requested_outcomes(text)
+                if explicit:
+                    base['outcome'] = explicit[0]
+                spec = intent.patch.apply(base)
+            elif spec is not None:
+                # route() already compiled the exclusion for a complete question.
+                return _validated(spec),pending
+        elif intent.operations and spec is not None:
+            spec = intent.patch.apply(spec)
+        return (_validated(spec) if spec is not None else None),pending
+
+    def _resolve_legacy(self, text, conversation, routed):
         q = text.lower()
         for _ in range(4):
             cleaned=re.sub(r'^(?:请你|请|帮我|麻烦你|麻烦|能不能|可以帮我|可以)\s*','',q)
@@ -801,8 +876,18 @@ class ConversationService:
                 raise RuntimeError('This conversation is still processing its previous message. Please wait.')
             conversation = self._load(conversation_id)
             text = _redact(text.strip())
+            execution=current_execution()
+            if execution is not None:
+                completed=next((item for item in conversation['messages'] if item.get('role')=='assistant' and item.get('turn_id')==execution.turn_id),None)
+                if completed is not None:
+                    execution.link_messages(assistant_message_id=completed['id'])
+                    return {'conversation_id':conversation_id,'conversation':self._public(conversation),
+                            'message':copy.deepcopy(completed),'result':self._run(completed.get('run_id'))}
+                execution.check_cancelled()
             process = []
             def emit(event):
+                if execution is not None:
+                    execution.check_cancelled()
                 if not isinstance(event, dict):
                     return
                 event = {key:_safe_facts(event.get(key)) for key in ('stage','label','status','detail','timestamp','facts','elapsed_ms') if key in event}
@@ -816,11 +901,20 @@ class ConversationService:
                     except Exception:
                         pass
             emit({'stage':'understand','label':'Read conversation context','status':'running','detail':'Read the saved research context before deciding whether survey work is needed.'})
-            user = {'id':uuid.uuid4().hex,'role':'user','content':text,'created_at':_now(),
-                    'kind':'user','status':'complete','process':[],'suggestions':[]}
-            conversation['messages'].append(user)
-            conversation['updated_at'] = _now()
-            self._save(conversation)
+            user=next((item for item in conversation['messages'] if execution is not None and
+                       item.get('role')=='user' and item.get('turn_id')==execution.turn_id),None)
+            if user is not None and user.get('content')!=text:
+                raise ValueError('A recovered turn has different message content.')
+            if user is None:
+                user = {'id':uuid.uuid4().hex,'role':'user','content':text,'created_at':_now(),
+                        'kind':'user','status':'complete','process':[],'suggestions':[]}
+                if execution is not None:
+                    user.update(turn_id=execution.turn_id,client_message_id=execution.client_message_id)
+                conversation['messages'].append(user)
+                conversation['updated_at'] = _now()
+                self._save(conversation)
+            if execution is not None:
+                execution.link_messages(user_message_id=user['id'])
             routed = route(text)
             result = None
             source_run_id = None
@@ -897,6 +991,10 @@ class ConversationService:
             elif routed.get('status') == 'blocked' and not explaining_floor:
                 answer, status, kind = routed['answer'], 'blocked', 'blocked'
                 emit({'stage':'scope','label':'Check the registered research scope','status':'blocked','detail':answer})
+            elif (routed.get('intent') or {}).get('resolution')=='clarify':
+                answer, status, kind = routed.get('answer') or 'Please clarify the unsupported analysis condition.', 'clarify', 'clarification'
+                emit({'stage':'scope','label':'Check explicit request constraints','status':'blocked','detail':answer,
+                      'facts':{'constraints':routed['intent']}})
             elif ((plot_request or batch_requested) and routed.get('status') == 'clarify' and routed.get('answer')
                   and not routed['answer'].startswith(('For survey calculation,','Choose one grouping dimension,'))):
                 answer, status, kind = routed['answer'], 'clarify', 'clarification'
@@ -1152,6 +1250,8 @@ class ConversationService:
             message = {'id':uuid.uuid4().hex,'role':'assistant','content':_redact(str(answer)),
                        'created_at':_now(),'status':status,'kind':kind,'process':process,'suggestions':suggestions,
                        'generation':generation}
+            if execution is not None:
+                message.update(turn_id=execution.turn_id,client_message_id=execution.client_message_id)
             if charts:
                 message['charts'] = charts
             if decision and (not chat_turn or chat_reference_clarification):
@@ -1171,6 +1271,8 @@ class ConversationService:
                 context['last_turn_mode'] = 'research'
             conversation['updated_at'] = _now()
             self._save(conversation)
+            if execution is not None:
+                execution.link_messages(assistant_message_id=message['id'])
             return {'conversation_id':conversation_id,'conversation':self._public(conversation),
                     'message':copy.deepcopy(message),'result':result}
         finally:

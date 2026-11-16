@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import threading
 import uuid
+import time
 
 from . import data, models, stats
 from .spec import route, fingerprint, GROUPS
@@ -17,15 +18,25 @@ from .process import ProcessTrace, describe_spec
 from .cache import SurveyCache
 from . import chat_api, grounding, dialogue
 from .outcomes import get_outcome, allowed_outcomes
+from .intent import inspect_intent, ExecutionPlan, PublishedResult
+from .execution_context import current as current_execution, ExecutionContext, bind
+from .job_store import workspace_identity
+from .storage_policy import StoragePolicy
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def write_json(path, value):
     path = Path(path)
-    temporary = path.with_suffix(path.suffix + '.tmp')
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
-    temporary.replace(path)
+    temporary = path.with_suffix(path.suffix+'.'+uuid.uuid4().hex+'.tmp')
+    payload=json.dumps(value,ensure_ascii=False,indent=2,allow_nan=False).encode('utf-8')
+    try:
+        descriptor=os.open(str(temporary),os.O_CREAT|os.O_EXCL|os.O_WRONLY|getattr(os,'O_NOFOLLOW',0),0o600)
+        with os.fdopen(descriptor,'wb') as stream:
+            stream.write(payload);stream.flush();os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def validate_rows(rows):
@@ -169,10 +180,10 @@ def markdown_report(result):
 
 class Agent:
     def __init__(self, root=ROOT, *, data_root=None):
-        self.root = Path(root)
+        self.root = Path(root).expanduser().resolve()
         # Public visitors share the verified official input files, while all
         # conversations, audit records and caches stay in their own workspace.
-        self.data_root = Path(data_root) if data_root is not None else self.root
+        self.data_root = Path(data_root).expanduser().resolve() if data_root is not None else self.root
         (self.root / 'runs').mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._download_state = {'status': 'idle', 'message': ''}
@@ -185,23 +196,26 @@ class Agent:
         self._model_config_lock = threading.RLock()
         self._model_revision = 0
         self._dialogue_connection = {'status': 'unverified', 'message': 'No real API request has been performed yet.'}
+        from .readiness import ObservedReadiness
+        self._statistics_health = ObservedReadiness(stats.readiness)
 
     def workspace(self, root):
         """Create isolated state with a snapshot of server-only model settings."""
         scoped = Agent(root=root, data_root=self.data_root)
+        scoped._statistics_health = self._statistics_health
         with self._model_config_lock:
             scoped._model = self._model.copy()
             scoped._model_revision = self._model_revision
         return scoped
 
-    def status(self):
+    def status(self, *, wait_for_statistics=False):
         registry_path = self.root / 'config' / 'registry.json'
         if not registry_path.is_file():
             registry_path = ROOT / 'config' / 'registry.json'
         registry = json.loads(registry_path.read_text()) if registry_path.exists() else {}
         config = self._model.copy()
         return {'data': dict(data.status(self.data_root), download=self._download_state.copy()),
-                'statistics': stats.readiness(),
+                'statistics': self._statistics_health.snapshot(wait=wait_for_statistics),
                 'models': models.public_status(config),
                 'dialogue': self.dialogue_status(),
                 'capabilities': [{'id': key, 'label': value} for key, value in GROUPS.items()],
@@ -212,50 +226,16 @@ class Agent:
 
     def history(self, limit=30):
         """List only completed local run metadata, never model responses or records."""
-        if type(limit) is not int or not 1 <= limit <= 100:
-            raise ValueError('The history limit must be an integer from 1 to 100.')
-        runs_root = self.root / 'runs'
-        try:
-            directories = sorted(runs_root.iterdir(), key=lambda path: path.name, reverse=True)
-        except OSError:
-            return []
-        items = []
-        for directory in directories:
-            if directory.is_symlink() or not directory.is_dir() or not re.fullmatch(r'[0-9]{8}T[0-9]{6}Z-[a-f0-9]{10}', directory.name):
-                continue
-            registration_path = directory / 'registration.json'
-            result_path = directory / 'result.json'
-            try:
-                if registration_path.is_symlink() or result_path.is_symlink():
-                    continue
-                # Partial writes and unexpectedly large files do not block the list.
-                if registration_path.stat().st_size > 64 * 1024 or result_path.stat().st_size > 16 * 1024 * 1024:
-                    continue
-                registration = json.loads(registration_path.read_text(encoding='utf-8'))
-                result = json.loads(result_path.read_text(encoding='utf-8'))
-                if not isinstance(registration, dict) or not isinstance(result, dict):
-                    continue
-                spec = registration.get('spec')
-                question = registration.get('question')
-                created_at = registration.get('registered_at')
-                if (result.get('run_id') != directory.name or result.get('status') not in ('ok', 'blocked', 'clarify')
-                        or not isinstance(spec, dict) or not isinstance(question, str) or not 1 <= len(question) <= 2000
-                        or not isinstance(created_at, str)):
-                    continue
-                dt.datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                measurement = result.get('measurement')
-                model = measurement.get('model') if isinstance(measurement, dict) else None
-                items.append({'run_id': directory.name, 'question': question,
-                              'status': result['status'], 'group_by': spec.get('group_by'),
-                              'analysis': spec.get('analysis'), 'model': model if isinstance(model, str) else None,
-                              'created_at': created_at})
-                if 'outcome' in spec:
-                    items[-1]['outcome'] = spec['outcome']
-            except (OSError, ValueError, TypeError, UnicodeError):
-                continue
-            if len(items) >= limit:
-                break
-        return items
+        return self.history_page(limit=limit)['runs']
+
+    def history_page(self, limit=30, before=None):
+        """Page through a derived summary index owned by this workspace."""
+        from .history_index import HistoryIndex
+        index=getattr(self,'_run_history_index',None)
+        if index is None:
+            index=HistoryIndex(self.root)
+            self._run_history_index=index
+        return index.page(limit=limit,before=before)
 
     def configure_model(self, config):
         provider = config.get('provider', 'openai')
@@ -363,6 +343,9 @@ class Agent:
         return self._download_state.copy()
 
     def ask(self, question, measure_model=False, repeats=5, prompt_versions=3, on_progress=None):
+        if current_execution() is None:
+            with bind(self._local_execution()):
+                return self.ask(question,measure_model,repeats,prompt_versions,on_progress)
         trace = ProcessTrace(on_progress)
         trace.emit('understand', 'running', 'Map the question to the registered population, outcome, and grouping.')
         routed = route(question)
@@ -374,18 +357,52 @@ class Agent:
 
     def analyze_spec(self, spec, question, measure_model=False, repeats=5, prompt_versions=3, on_progress=None):
         """Execute a validated context-resolved specification, without reparsing a follow-up."""
+        if current_execution() is None:
+            with bind(self._local_execution()):
+                return self.analyze_spec(spec,question,measure_model,repeats,prompt_versions,on_progress)
         trace = ProcessTrace(on_progress)
         trace.emit('understand', 'running', 'Combine this request with the research scope of the current conversation.')
+        intent=inspect_intent(question)
+        if intent.resolution!='ready':
+            return {'status':'clarify','answer':intent.clarification(),'messages':[], 'intent':intent.document(),'process':trace.events}
         try:
             clean = stats._normalise_spec(spec)
         except (ValueError, TypeError) as error:
             trace.emit('understand', 'blocked', str(error))
             return {'status':'blocked', 'answer':str(error), 'messages':[], 'process':trace.events}
+        from .intent import coverage_check
+        uncovered = coverage_check(intent, clean)
+        if uncovered:
+            trace.emit('understand', 'blocked', uncovered)
+            return {'status':'clarify', 'answer':uncovered, 'messages':[],
+                    'intent':intent.document(), 'process':trace.events}
         constants = {key: spec[key] for key in ('version', 'age_min', 'age_max', 'confidence') if key in spec}
         # Keep caller-friendly scalar/list filters; R receives its own normalized version.
         validated = dict(clean, **constants)
         trace.emit('understand', 'complete', 'Conversation context is resolved; the year, outcome, and survey rules retain their registered values.')
+        execution=current_execution()
+        if execution is not None:
+            execution.check_cancelled()
+            key='analysis:'+fingerprint(validated)
+            identity=fingerprint({'spec':validated,'measure_model':measure_model,'repeats':repeats,
+                                  'prompt_versions':prompt_versions,'registry':hashlib.sha256((ROOT/'config/registry.json').read_bytes()).hexdigest(),
+                                  'statistics':hashlib.sha256((ROOT/'scripts/analyze.R').read_bytes()).hexdigest()})
+            saved=execution.load_step(key,identity)
+            if saved is not None:
+                trace.emit('statistics','complete','Restored the completed analysis checkpoint without rerunning statistics or model measurements.',
+                           {'source_run_id':saved.get('run_id'),'checkpoint_restored':True})
+                return saved
+            result=self._execute_spec(validated,question,measure_model,repeats,prompt_versions,trace)
+            execution.save_step(key,result,identity,kind='analysis')
+            return result
         return self._execute_spec(validated, question, measure_model, repeats, prompt_versions, trace)
+
+    def _local_execution(self):
+        seconds=os.environ.get('NHIS_JOB_WALL_SECONDS','900')
+        if not seconds.isascii() or not seconds.isdigit() or not 1<=int(seconds)<=3600:
+            raise ValueError('NHIS_JOB_WALL_SECONDS must be an integer from 1 to 3600.')
+        return ExecutionContext(workspace_id=workspace_identity(self.root),turn_id=uuid.uuid4().hex,
+            state_root=self.root,deadline=time.monotonic()+int(seconds))
 
     def _execute_spec(self, spec, question, measure_model, repeats, prompt_versions, trace):
         outcome = get_outcome(spec.get('outcome','fair_poor'))
@@ -396,23 +413,52 @@ class Agent:
         if not isinstance(question, str) or not 1 <= len(question.strip()) <= 2000:
             raise ValueError('Enter a question of 1–2,000 characters.')
         model_config = self._model.copy()
+        storage=StoragePolicy(self.root)
+        with storage.write_guard():
+            storage.check_run_admission()
         trace.emit('scope', 'running', 'Check the registered population, outcome, filters, and statistical method.')
         plan = describe_spec(spec)
         trace.emit('scope', 'complete', plan['population'] + '; grouped by ' + plan['group_by'] + '; ' + ('; '.join(plan['filters']) or 'no additional category filters'), plan)
-        run_id = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ-') + uuid.uuid4().hex[:10]
+        execution=current_execution()
+        inputs_hash=fingerprint({'spec':spec,'measure_model':measure_model,'repeats':repeats,'prompt_versions':prompt_versions})
+        registration_key='registration:'+fingerprint(spec)
+        restored=execution.load_step(registration_key,inputs_hash) if execution is not None else None
+        run_id = restored['run_id'] if restored else dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ-') + uuid.uuid4().hex[:10]
         directory = self.root / 'runs' / run_id
-        directory.mkdir()
-        trace.attach(directory)
-        registration = {'spec': spec, 'spec_hash': fingerprint(spec), 'question': question,
+        directory.mkdir(exist_ok=bool(restored))
+        if execution is not None:
+            execution.run_id=run_id
+            if restored is None:
+                execution.save_step(registration_key,{'run_id':run_id},inputs_hash,kind='registration')
+        trace.attach(directory,resume=bool(restored))
+        registration = {'schema_version':2,'spec': spec, 'spec_hash': fingerprint(spec), 'question': question,
+                        'intent':inspect_intent(question).document(),
                         'measure_model': measure_model, 'repeats': repeats, 'prompt_versions': prompt_versions,
                         'registered_at': dt.datetime.now(dt.timezone.utc).isoformat()}
-        write_json(directory / 'registration.json', registration)
+        if not restored:
+            write_json(directory / 'registration.json', registration)
         result = {'run_id': run_id, 'status': 'blocked', 'spec': spec, 'spec_hash': fingerprint(spec),
                   'survey': {'rows': []}, 'measurement': {'status': 'not_requested', 'rows': []},
                   'comparison': [], 'messages': [], 'analysis_plan':plan,
                   'validation': {'r_stata': 'pending', 'nchs_external': 'pending'}}
         trace.emit('data', 'running', 'Verify the CDC download record, CSV integrity, and survey design fields without transmitting individual records.')
         dataset = data.status(self.data_root)
+        source_hashes={name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in
+                       ('config/registry.json','scripts/analyze.R','nhis_agent/stats.py','nhis_agent/spec.py','nhis_agent/intent.py',
+                        'nhis_agent/engine.py','nhis_agent/r_worker.py','nhis_agent/models.py','nhis_agent/transport.py')}
+        configuration={key:model_config.get(key) for key in ('provider','base_url','model')}
+        runtime=self._statistics_health.snapshot(wait=True) if dataset.get('ready') else {}
+        frozen=ExecutionPlan.freeze(spec,{'sources':source_hashes,'data':dataset.get('sha256'),
+            'runtime':{key:runtime.get(key) for key in ('r_version','survey_version','jsonlite_version','mitools_version')},
+            'income':(dataset.get('datasets',{}).get('income') or {}).get('sha256'),
+            'prompt_registry':models.prompt_registry(spec).get('sha256'),
+            'model_configuration':hashlib.sha256(json.dumps(configuration,sort_keys=True).encode()).hexdigest()})
+        if restored and (directory/'execution_plan.json').exists():
+            prior=json.loads((directory/'execution_plan.json').read_text())
+            if prior.get('plan_hash')!=frozen.document()['plan_hash']:
+                raise ValueError('The frozen execution inputs changed; this interrupted analysis cannot be silently resumed.')
+        else:
+            write_json(directory/'execution_plan.json',frozen.document())
         if not dataset.get('ready'):
             result['answer'] = 'The official NHIS 2024 Sample Adult data have not been obtained and verified, so no statistics were generated. Select Download official data or run scripts/setup.command in a terminal.'
             result['messages'].append(dataset.get('message', 'The official data are not ready.'))
@@ -432,7 +478,14 @@ class Agent:
                     'outcome':outcome['label'],
                     'estimation':'Registered complex-survey logistic models; adjusted and unadjusted models use the same complete cases.' if spec.get('analysis') == 'regression' else 'Group proportion = Σ(survey weight × registered outcome indicator) / Σsurvey weight; standard errors use Taylor linearization with strata and PSUs.',
                     'income_imputations':10 if spec.get('group_by') == 'income' or 'income' in spec.get('filters', {}) or spec.get('analysis') == 'regression' and spec.get('adjustment') == 'full' else None})
-        if cached:
+        checkpoint_key='statistics:'+fingerprint(spec)
+        checkpoint_hash=fingerprint({'spec':spec,'plan_hash':frozen.document()['plan_hash'],'sources':source_hashes,'data':dataset.get('sha256'),
+                                     'income':(dataset.get('datasets',{}).get('income') or {}).get('sha256')})
+        checkpoint=execution.load_step(checkpoint_key,checkpoint_hash) if execution is not None else None
+        if checkpoint is not None:
+            survey=checkpoint
+            trace.emit('statistics','complete','Restored a completed statistical checkpoint; R was not rerun.',{'checkpoint_restored':True})
+        elif cached:
             survey = cached['survey']
             survey.setdefault('provenance', {})['cache_reuse'] = {'source_run_id':cached['source_run_id'], 'key':cached['key']}
             write_json(directory/'analysis_spec.json', stats._normalise_spec(spec))
@@ -441,11 +494,13 @@ class Agent:
                        'note':'R was not rerun. Aggregate estimates were reused only after matching the data, analysis specification, statistical source code, and R package versions.'})
         else:
             survey = stats.analyze(str(self.data_root / 'data' / 'adult24.csv'), spec, str(directory))
+        if execution is not None and checkpoint is None:
+            execution.save_step(checkpoint_key,survey,checkpoint_hash,kind='statistics')
         result['cache'] = {'hit':bool(cached), 'source_run_id':cached['source_run_id'] if cached else None}
         result['survey'] = survey
         if survey.get('status') != 'ok':
             result['answer'] = survey.get('message') or survey.get('reason') or 'The statistical calculation failed validation and will not enter the report.'
-            trace.emit('statistics', 'blocked', result['answer'])
+            trace.emit('statistics', 'blocked', result['answer'],{'error_code':survey.get('code')})
             return self._finish(directory, result, trace)
         denominators = survey.get('denominators', {})
         if spec.get('outcome','fair_poor') != 'fair_poor' and (not isinstance(survey.get('outcome'),dict) or
@@ -494,7 +549,7 @@ class Agent:
             trace.emit('model', 'skipped', result['measurement']['message'])
         elif not measure_model:
             trace.emit('model', 'skipped', 'This step computed only the survey benchmark; no independent model measurement was requested.')
-        if measure_model and rows:
+        if measure_model and rows and spec.get('analysis')!='regression':
             # Freeze the plan before calling any remote service. Never pass survey rows to models.
             groups = [{'group_id': r['group_id'], 'label': r['label']} for r in rows]
             write_json(directory / 'measurement_plan.json', {'spec': spec, 'groups': groups, 'repeats': repeats,
@@ -559,10 +614,15 @@ class Agent:
         return '\n'.join(lines)
 
     def _finish(self, directory, result, trace=None):
+        execution=current_execution()
+        if execution is not None:
+            execution.check_cancelled()
         if trace:
             trace.emit('report', 'running', 'Save the analysis specification, observed calculation steps, results, and reproducibility records.')
         run_id = result['run_id']
         result['artifacts'] = {'json': '/api/runs/' + run_id}
+        result['schema_version']=2
+        result['publication']=PublishedResult(run_id,result.get('status','blocked'),result.get('spec',{}).get('outcome','fair_poor')).__dict__
         if result['status'] == 'ok':
             result['artifacts'].update({'report': '/api/runs/' + run_id + '/report', 'csv': '/api/runs/' + run_id + '/csv'})
             (directory / 'report.md').write_text(markdown_report(result), encoding='utf-8')
@@ -571,5 +631,35 @@ class Agent:
             trace.emit('report', 'complete', 'The run record was saved.' if result['status'] != 'ok' else 'The aggregate statistical report and data table were saved and are available to inspect or export.',
                        {'run_id':run_id, 'report_released':result['status'] == 'ok'})
             result['process'] = list(trace.events)
-        write_json(directory / 'result.json', result)
+        storage=StoragePolicy(self.root)
+        with storage.write_guard():
+            pending=directory/('.publication-'+uuid.uuid4().hex+'.json')
+            write_json(pending,result)
+            try:
+                storage.check_run_size(directory)
+                pending.replace(directory/'result.json')
+            except ValueError as error:
+                from .storage_policy import StorageLimit
+                if not isinstance(error,StorageLimit):raise
+                # Retain private statistical/audit inputs for review. Exports
+                # are published only after final byte and result checks pass.
+                for name in ('report.md','estimates.csv'):
+                    (directory/name).unlink(missing_ok=True)
+                if trace:
+                    trace.emit('report','blocked','The final artifact-size check failed. No report or table was released.',{'error_code':error.code,'report_released':False})
+                    result['process']=list(trace.events)
+                result={key:value for key,value in result.items() if key in ('run_id','spec','process','schema_version')}
+                result.update(status='blocked',code=error.code,answer=str(error),
+                    survey={'status':'blocked','rows':[]},artifacts={'json':'/api/runs/'+run_id},
+                    publication=PublishedResult(run_id,'blocked',result.get('spec',{}).get('outcome','fair_poor')).__dict__)
+                write_json(directory/'result.json',result)
+            finally:
+                pending.unlink(missing_ok=True)
+        try:
+            from .history_index import HistoryIndex
+            HistoryIndex(self.root).record(run_id)
+        except Exception as error:
+            from .telemetry import log_error
+            try:log_error(self.root,'history.index_failed',error,execution.identifiers() if execution else {})
+            except Exception:pass
         return result

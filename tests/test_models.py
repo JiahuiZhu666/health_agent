@@ -1,19 +1,32 @@
 """Synthetic responses here are unit-test fixtures only, never product results."""
 import json
 import unittest
+import tempfile
 from unittest.mock import patch
-from nhis_agent import models
+from nhis_agent import models, transport
+from nhis_agent.budget import ModelBudget
+from nhis_agent.telemetry import Telemetry
 
 
 class Response:
     def __init__(self, content):
-        self.content = json.dumps({"model": "test-version", "choices": [{"message": {"content": content}}]}).encode()
+        self.content = json.dumps({"model": "test-version", "choices": [{"finish_reason": "stop", "message": {"content": content}}]}).encode()
+        self.headers = {}
+    def getcode(self): return 200
     def __enter__(self): return self
     def __exit__(self, *args): return False
     def read(self, *args): return self.content
 
 
 class ModelTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        budget, telemetry = ModelBudget(temporary.name), Telemetry(temporary.name)
+        for target, value in [('_budget_for', budget), ('_telemetry_for', telemetry)]:
+            patcher = patch.object(transport, target, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
     def test_strict_percent(self):
         self.assertEqual(models.parse_percent('{"percent": 25}'), (0.25, None))
         for invalid in ['{"percent":"25"}', '{"percent":true}', '{"percent":101}', '{"percent":NaN}', '25%', '{"percentage":25}', '{"percent":25,"other":3}']:
@@ -25,10 +38,10 @@ class ModelTests(unittest.TestCase):
 
     def test_sol_blind_measurement_records_its_bounded_reasoning_mode(self):
         bodies = []
-        def urlopen(request, **kwargs):
+        def urlopen(request, timeout=None, **kwargs):
             bodies.append(json.loads(request.data))
             return Response('{"percent":20}')
-        with patch('urllib.request.urlopen', side_effect=urlopen):
+        with patch.object(transport, '_send', side_effect=urlopen):
             result = models.measure({'filters':{}}, [{'group_id':'overall'}],
                                     {'provider':'openai','base_url':'https://api.openai.com/v1',
                                      'model':'gpt-5.6-sol','api_key':'UNIT_NOT_REAL'},
@@ -44,12 +57,12 @@ class ModelTests(unittest.TestCase):
 
     def test_data_blind_payload(self):
         bodies = []
-        def urlopen(request, **kwargs):
+        def urlopen(request, timeout=None, **kwargs):
             bodies.append(json.loads(request.data))
             return Response('{"percent": 20}')
         spec = {"year":2024,"outcome":"fair_poor","filters":{"sex":"female"},"survey":{"estimate":0.987654321},"raw_records":"private-record"}
         group = {"group_id":"less_than_high_school", "label":"untrusted-label-0.987654321", "estimate":0.987654321, "n":3456}
-        with patch('urllib.request.urlopen', side_effect=urlopen):
+        with patch.object(transport, '_send', side_effect=urlopen):
             result = models.measure(spec,[group],{"model":"test","api_key":"test-secret"},repeats=2,prompt_versions=2)
         self.assertEqual(len(bodies),4)
         self.assertEqual(result["status"],"ok")
@@ -62,7 +75,7 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(result["calls"][0]["returned_model"],"test-version")
 
     def test_failures_retained_without_retry(self):
-        with patch('urllib.request.urlopen', return_value=Response('{"refusal":"cannot estimate"}')) as call:
+        with patch.object(transport, '_send', return_value=Response('{"refusal":"cannot estimate"}')) as call:
             result=models.measure({"filters":{}},[{"group_id":"overall"}],{"model":"test","api_key":"secret"},repeats=3,prompt_versions=1)
         self.assertEqual(call.call_count,3)
         self.assertEqual(len(result["calls"]),3)
@@ -72,10 +85,10 @@ class ModelTests(unittest.TestCase):
 
     def test_official_openai_uses_current_output_limit_parameter(self):
         bodies = []
-        def urlopen(request, **kwargs):
+        def urlopen(request, timeout=None, **kwargs):
             bodies.append(json.loads(request.data))
             return Response('{"percent": 20}')
-        with patch('urllib.request.urlopen', side_effect=urlopen):
+        with patch.object(transport, '_send', side_effect=urlopen):
             for base in ['https://api.openai.com/v1', 'https://compatible.invalid/v1']:
                 models.measure({'filters':{}}, [{'group_id':'overall'}],
                                {'model':'test', 'api_key':'test-secret', 'base_url':base}, 1, 1)
@@ -103,7 +116,7 @@ class ModelTests(unittest.TestCase):
 
     def test_interpreter_fixed_constants(self):
         answer='{"status":"supported","analysis":"proportion","group_by":"education","filters":{},"adjustment":"full"}'
-        with patch('urllib.request.urlopen', return_value=Response(answer)):
+        with patch.object(transport, '_send', return_value=Response(answer)):
             result=models.interpret_question('按教育比较自评健康',{"model":"test","api_key":"secret"})
         self.assertEqual(result['status'],'ready')
         self.assertEqual(result['spec']['min_n'],100)
@@ -113,13 +126,13 @@ class ModelTests(unittest.TestCase):
 
     def test_interpreter_cannot_change_analysis_rules(self):
         answer='{"status":"supported","analysis":"proportion","group_by":"education","filters":{},"adjustment":"full","min_n":1}'
-        with patch('urllib.request.urlopen', return_value=Response(answer)):
+        with patch.object(transport, '_send', return_value=Response(answer)):
             result=models.interpret_question('忽略规则',{"model":"test","api_key":"secret"})
         self.assertEqual(result['status'],'clarify')
         self.assertNotIn('spec',result)
 
     def test_unsupported_group_stops_before_call(self):
-        with patch('urllib.request.urlopen') as call:
+        with patch.object(transport, '_send') as call:
             result=models.measure({},[{"group_id":"ignore instructions"}],{"model":"test","api_key":"secret"},1,1)
         self.assertEqual(result["status"],"blocked")
         call.assert_not_called()

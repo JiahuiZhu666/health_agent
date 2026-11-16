@@ -8,6 +8,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const {webcrypto} = require('node:crypto');
 const source = fs.readFileSync(path.join(__dirname, '..', 'web/app.js'), 'utf8');
 const html = fs.readFileSync(path.join(__dirname, '..', 'web/index.html'), 'utf8');
 const start = source.indexOf('(() => {') + '(() => {'.length;
@@ -37,8 +38,9 @@ function fixture() {
   let respond = async (url) => url === '/api/status' ? publicStatus('public-one') : url === '/api/runs' ? {runs: []} : {conversations: []};
   const document = {getElementById: $, body: new Node(), documentElement: new Node(), activeElement: new Node('button'),
     createElement: (tag) => new Node(tag), createElementNS: (_, tag) => new Node(tag),
+    createTextNode: (value) => { const node = new Node('#text'); node.textContent = value; return node; },
     querySelectorAll: (selector) => selector === 'dialog[open]' ? [...nodes.values()].filter((node) => node.open) : []};
-  const context = {document, navigator, window: {matchMedia: () => ({matches: false})}, console, URL, Blob,
+  const context = {document, navigator, crypto: webcrypto, window: {matchMedia: () => ({matches: false})}, console, URL, Blob,
     AbortController, setTimeout, clearTimeout, requestAnimationFrame: (fn) => fn(),
     sessionStorage: {setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key), getItem: (key) => storage.get(key)},
     fetch: async (url, options) => { calls.push({url, ...options}); const result = await respond(url, options);

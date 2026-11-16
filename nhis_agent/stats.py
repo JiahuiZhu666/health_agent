@@ -1,5 +1,6 @@
 """Auditable bridge to R's survey package; never substitutes synthetic estimates."""
 import csv
+import copy
 import hashlib
 import json
 import math
@@ -7,8 +8,11 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import threading
+import time
 from datetime import datetime, timezone
 from .outcomes import get_outcome, allowed_outcomes
+from . import r_worker
 
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_PATH = ROOT / "config" / "registry.json"
@@ -29,45 +33,79 @@ def _blocked(code, reason, **extra):
     return result
 
 
-def readiness():
-    """Inspect project-local R first, then PATH, without changing the computer."""
-    candidates = []
-    project_r = ROOT / ".r-env" / "bin" / "Rscript"
-    if project_r.is_file() and os.access(str(project_r), os.X_OK):
-        candidates.append(str(project_r))
-    path_r = shutil.which("Rscript")
-    if path_r and path_r not in candidates:
-        candidates.append(path_r)
-    if not candidates:
-        return {"ready": False, "status": "blocked", "rscript": None,
-                "reason": "Rscript is unavailable. Run scripts/setup.command to install the isolated R environment, or install R and survey, jsonlite, and mitools.",
-                "install_url": "https://cran.r-project.org/", "packages": ["survey", "jsonlite", "mitools"]}
-    expression = ('p <- c("survey","jsonlite","mitools"); ok <- vapply(p,requireNamespace,logical(1),quietly=TRUE); '
-                  'if(!all(ok)){cat(paste(p[!ok],collapse=","));quit(status=2)}; '
-                  'cat(as.character(getRversion()),as.character(packageVersion("survey")),'
-                  'as.character(packageVersion("jsonlite")),as.character(packageVersion("mitools")),sep=intToUtf8(10))')
-    failures = []
+_READINESS_LOCK = threading.Lock()
+_READINESS_CACHE = {}
+
+
+def clear_readiness_cache():
+    """Explicit test/operator invalidation; normal calls share a 60-second observation."""
+    with _READINESS_LOCK:
+        _READINESS_CACHE.clear()
+
+
+def readiness(*, force=False):
+    """Single-flight, resource-bounded local dependency observation, never a model call."""
+    from .execution_context import current
+    context=current()
+    if context is not None:context.check_cancelled()
+    candidates=[]
+    project_r=ROOT/'.r-env'/'bin'/'Rscript'
+    if project_r.is_file() and os.access(str(project_r),os.X_OK):candidates.append(str(project_r.resolve()))
+    path_r=shutil.which('Rscript')
+    if path_r and str(Path(path_r).resolve()) not in candidates:candidates.append(str(Path(path_r).resolve()))
+    identity=[]
     for executable in candidates:
-        try:
-            process = subprocess.run([executable, "--vanilla", "-e", expression], capture_output=True,
-                                     text=True, timeout=30, check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            failures.append(executable + ": " + str(exc))
-            continue
-        if process.returncode:
-            failures.append(executable + ": " + (process.stdout.strip() or process.stderr.strip() or "dependency check failed"))
-            continue
-        versions = process.stdout.strip().splitlines()
-        if len(versions) != 4:
-            failures.append(executable + ": could not parse the four required runtime versions")
-            continue
-        return {"ready": True, "status": "ok", "rscript": executable,
-                "r_version": versions[0], "survey_version": versions[1],
-                "jsonlite_version": versions[2], "mitools_version": versions[3]}
-    return {"ready": False, "status": "blocked", "rscript": candidates[0],
-            "reason": "R runtime or dependencies are unavailable: " + "; ".join(failures),
-            "packages": ["survey", "jsonlite", "mitools"],
-            "install_command": "Run scripts/setup.command, or install R packages survey, jsonlite, and mitools."}
+        try:stamp=Path(executable).stat().st_mtime_ns
+        except OSError:stamp=None
+        identity.append((executable,stamp))
+    identity=tuple(identity)
+    deadline=time.monotonic()+30
+    if context is not None and getattr(context,'deadline',None) is not None:deadline=min(deadline,context.deadline)
+    acquired=False
+    while not acquired:
+        if context is not None:context.check_cancelled()
+        remaining=deadline-time.monotonic()
+        if remaining<=0:
+            return {'ready':False,'status':'busy','rscript':candidates[0] if candidates else None,
+                    'reason':'The shared runtime observation did not finish before its deadline.'}
+        acquired=_READINESS_LOCK.acquire(timeout=min(.05,remaining))
+    try:
+        if context is not None:context.check_cancelled()
+        cached=_READINESS_CACHE
+        if not force and cached.get('identity')==identity and time.monotonic()-cached.get('at',float('-inf'))<60:
+            return copy.deepcopy(cached['value'])
+        if not candidates:
+            value={'ready':False,'status':'blocked','rscript':None,
+                   'reason':'Rscript is unavailable. Run scripts/setup.command to install the isolated R environment, or install R and survey, jsonlite, and mitools.',
+                   'install_url':'https://cran.r-project.org/','packages':['survey','jsonlite','mitools']}
+        else:
+            value=None
+            for executable in candidates:
+                if context is not None:context.check_cancelled()
+                remaining=deadline-time.monotonic()
+                if remaining<=0:break
+                try:
+                    process=r_worker.run_probe(executable,timeout=remaining,context=context)
+                except r_worker.RWorkerBusy:
+                    return {'ready':False,'status':'busy','rscript':executable,
+                            'reason':'The shared statistical worker is busy; no additional runtime probe was started.'}
+                except (OSError,ValueError,subprocess.TimeoutExpired):
+                    continue
+                if process.returncode:continue
+                versions=process.stdout.strip().splitlines()
+                if len(versions)!=4 or any(not version.strip() or len(version)>80 for version in versions):continue
+                value={'ready':True,'status':'ok','rscript':executable,
+                       **dict(zip(('r_version','survey_version','jsonlite_version','mitools_version'),versions))}
+                break
+            if value is None:
+                value={'ready':False,'status':'blocked','rscript':candidates[0],
+                       'reason':'The bounded local R dependency probe did not confirm survey, jsonlite and mitools. No raw child output is included.',
+                       'packages':['survey','jsonlite','mitools'],
+                       'install_command':'Run scripts/setup.command, or install R packages survey, jsonlite and mitools.'}
+        _READINESS_CACHE.clear();_READINESS_CACHE.update(identity=identity,at=time.monotonic(),value=copy.deepcopy(value))
+        return value
+    finally:
+        _READINESS_LOCK.release()
 
 
 def _normalise_spec(spec):
@@ -285,12 +323,13 @@ def analyze(csv_path: str, spec: dict, run_dir: str) -> dict:
                            str(REGISTRY_PATH)]
                 (destination / "command.json").write_text(json.dumps(command, indent=2) + "\n", encoding="utf-8")
                 try:
-                    process = subprocess.run(command, capture_output=True, text=True, timeout=240,
-                                             check=False, cwd=str(ROOT))
+                    process = r_worker.run_r(command,cwd=str(ROOT))
                     (destination / "R.stdout.log").write_text(process.stdout, encoding="utf-8")
                     (destination / "R.stderr.log").write_text(process.stderr, encoding="utf-8")
                     if process.returncode != 0 or not output_path.is_file():
                         result = _blocked("r_analysis_failed", "The survey engine failed; inspect R.stderr.log.")
+                    elif output_path.stat().st_size > r_worker.limits()['output_bytes']:
+                        result = _blocked("r_output_limit", "The statistical result exceeded the configured output-size limit.")
                     else:
                         result = json.loads(output_path.read_text(encoding="utf-8"))
                         if not isinstance(result, dict) or result.get("status") not in ("ok", "blocked"):
@@ -300,7 +339,13 @@ def analyze(csv_path: str, spec: dict, run_dir: str) -> dict:
                         # Strict serialization rejects NaN rather than letting a UI show a result as valid.
                         json.dumps(result, allow_nan=False)
                 except subprocess.TimeoutExpired:
-                    result = _blocked("r_timeout", "Survey analysis exceeded the 240-second runtime limit.")
+                    result = _blocked("r_timeout", "Survey analysis exceeded its configured wall-clock limit.")
+                except r_worker.RWorkerBusy:
+                    result = _blocked("r_capacity_busy", "The statistical worker is busy. No new R calculation was started; try again later.")
+                except r_worker.RWorkerOutputLimit:
+                    result = _blocked("r_output_limit", "The statistical engine exceeded its output-size limit; no result was released.")
+                except r_worker.RStepBudgetExceeded:
+                    result = _blocked("r_step_budget_exceeded", "This turn reached its statistical-step budget; no further R calculation was started.")
                 except (OSError, ValueError, json.JSONDecodeError) as exc:
                     result = _blocked("r_result_invalid", str(exc))
                 result.update({"provenance": provenance, "runtime": runtime, "spec": clean_spec})

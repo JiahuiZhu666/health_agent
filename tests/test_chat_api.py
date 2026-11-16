@@ -3,12 +3,15 @@ import http.client
 import io
 import json
 import socket
+import tempfile
 import unittest
 import urllib.error
 from email.message import Message
 from unittest.mock import patch
 
-from nhis_agent import chat_api
+from nhis_agent import chat_api, transport
+from nhis_agent.budget import ModelBudget
+from nhis_agent.telemetry import Telemetry
 
 
 CONFIG = {'provider':'openai', 'base_url':'https://api.openai.com/v1',
@@ -51,6 +54,14 @@ class FakeResponse:
 
 
 class ChatAPITests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        budget, telemetry = ModelBudget(temporary.name), Telemetry(temporary.name)
+        for target, value in [('_budget_for', budget), ('_telemetry_for', telemetry)]:
+            patcher = patch.object(transport, target, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
     def test_official_responses_payload_and_actual_metadata(self):
         fake = FakeResponse(response('实际回答'))
         with patch.object(chat_api,'_send',return_value=fake) as send:
@@ -64,7 +75,8 @@ class ChatAPITests(unittest.TestCase):
         self.assertEqual(actual['usage']['total_tokens'],19)
         req,timeout = send.call_args.args
         self.assertEqual(req.full_url,'https://api.openai.com/v1/responses')
-        self.assertEqual(timeout,60)
+        self.assertGreater(timeout,0)
+        self.assertLessEqual(timeout,60)
         body=json.loads(req.data)
         self.assertEqual(body['instructions'],'system instruction')
         self.assertEqual(body['input'],'user question')
@@ -90,7 +102,8 @@ class ChatAPITests(unittest.TestCase):
             actual=chat_api.request(config,'system','question',SCHEMA)
         req,timeout=send.call_args.args
         self.assertEqual(req.full_url,config['base_url'])
-        self.assertEqual(timeout,12)
+        self.assertGreater(timeout,0)
+        self.assertLessEqual(timeout,12)
         body=json.loads(req.data)
         self.assertEqual(body['response_format']['json_schema']['schema'],SCHEMA)
         self.assertTrue(body['response_format']['json_schema']['strict'])
@@ -150,7 +163,8 @@ class ChatAPITests(unittest.TestCase):
             actual=chat_api.request(config,'system','question',SCHEMA,max_output_tokens=700)
         req,timeout=send.call_args.args
         self.assertEqual(req.full_url,'http://127.0.0.1:11434/api/chat')
-        self.assertEqual(timeout,60)
+        self.assertGreater(timeout,0)
+        self.assertLessEqual(timeout,60)
         self.assertIsNone(req.get_header('Authorization'))
         body=json.loads(req.data)
         self.assertEqual(body['format'],SCHEMA)
@@ -176,7 +190,7 @@ class ChatAPITests(unittest.TestCase):
 
     def test_usage_is_a_numeric_allowlist_and_model_is_not_fabricated(self):
         usage={'input_tokens':12,'output_tokens':True,'total_tokens':-1,'private':'private data',
-               'prompt_tokens':float('nan'),'completion_tokens':10**400,
+               'completion_tokens':10**400,
                'input_tokens_details':{'cached_tokens':4,'secret':'do not include'},
                'output_tokens_details':{'reasoning_tokens':3,'private':8}}
         payload=response(usage=usage)

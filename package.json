@@ -1,0 +1,13 @@
+{
+  "name": "nhis-lab-browser-checks",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Development-only browser checks with isolated fixture transport",
+  "scripts": {
+    "test:browser": "playwright test",
+    "test:browser:list": "playwright test --list"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.1"
+  }
+}

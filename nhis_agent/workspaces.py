@@ -3,10 +3,12 @@ from collections import OrderedDict
 from pathlib import Path
 import re
 import threading
+import time
 from types import SimpleNamespace
 
 from .conversation import ConversationService
 from .jobs import ChatJobs, ConversationBusy
+from .job_store import JobStore
 
 
 class VisitorWorkspaces:
@@ -21,6 +23,8 @@ class VisitorWorkspaces:
         self._capacity = threading.BoundedSemaphore(concurrent)
         self._lock = threading.Lock()
         self._items = OrderedDict()
+        # Initialize shared tables before any public quota transaction starts.
+        self._store = JobStore(agent.root)
 
     def _root(self, visitor):
         if not isinstance(visitor, str) or not re.fullmatch(r'[a-f0-9]{32}', visitor):
@@ -31,7 +35,7 @@ class VisitorWorkspaces:
                 raise ValueError('Visitor state must not contain symbolic links.')
         return root
 
-    def acquire(self, visitor, *, create=False):
+    def acquire(self, visitor, *, create=False, connection=None):
         """Lease an existing workspace; only admitted chat creation makes one."""
         with self._lock:
             root = self._root(visitor)
@@ -41,7 +45,7 @@ class VisitorWorkspaces:
             if item is None:
                 if len(self._items) >= self._maximum:
                     for key, candidate in self._items.items():
-                        if not candidate.leases and not candidate.jobs.has_active():
+                        if not candidate.leases and not candidate.jobs.has_active(connection=connection):
                             del self._items[key]
                             break
                     else:
@@ -50,7 +54,7 @@ class VisitorWorkspaces:
                 scoped = self.agent.workspace(root)
                 conversations = ConversationService(scoped)
                 item = SimpleNamespace(agent=scoped, conversations=conversations,
-                                       jobs=ChatJobs(conversations, capacity=self._capacity), leases=0)
+                                       jobs=ChatJobs(conversations, capacity=self._capacity, store=self._store, reconcile=False), leases=0)
                 self._items[visitor] = item
             item.leases += 1
             self._items.move_to_end(visitor)
@@ -59,3 +63,10 @@ class VisitorWorkspaces:
     def release(self, visitor):
         with self._lock:
             self._items[visitor].leases -= 1
+
+    def shutdown(self, timeout=10):
+        with self._lock:
+            items=list(self._items.values())
+        deadline=time.monotonic()+timeout
+        for item in items:
+            item.jobs.shutdown(timeout=max(0,deadline-time.monotonic()))

@@ -1,0 +1,425 @@
+{
+  "schema_version": 1,
+  "purpose": "Bounded intent fidelity regression corpus; artificial requests only",
+  "cases": [
+    {
+      "id": "GROUP-ZH-RELIGION",
+      "question": "按宗教比较自评健康",
+      "ready": false
+    },
+    {
+      "id": "GROUP-ZH-MIXED-RELIGION",
+      "question": "按教育和宗教比较自评健康",
+      "ready": false
+    },
+    {
+      "id": "UNKNOWN-BLOOD-GLUCOSE-NO-RATE",
+      "question": "Compare blood glucose by education",
+      "ready": false
+    },
+    {
+      "id": "READY-ZH-EDUCATION",
+      "question": "按教育比较自评健康",
+      "ready": true,
+      "spec": {"group_by": "education", "outcome": "fair_poor"}
+    },
+    {
+      "id": "INT-01",
+      "question": "Compare asthma prevalence by education in NHIS 2024",
+      "ready": false
+    },
+    {
+      "id": "INT-02",
+      "question": "Compare fair/poor health by education among married adults",
+      "ready": false
+    },
+    {
+      "id": "INT-03",
+      "question": "Compare fair/poor health by education excluding women",
+      "ready": true,
+      "spec": {
+        "filters": {
+          "sex": "male"
+        }
+      }
+    },
+    {
+      "id": "UNKNOWN-EN-0",
+      "question": "Compare asthma prevalence by education in NHIS 2024",
+      "ready": false
+    },
+    {
+      "id": "UNKNOWN-EN-1",
+      "question": "Compare arthritis prevalence by education in NHIS 2024",
+      "ready": false
+    },
+    {
+      "id": "UNKNOWN-EN-2",
+      "question": "Compare dementia prevalence by education in NHIS 2024",
+      "ready": false
+    },
+    {
+      "id": "UNKNOWN-EN-3",
+      "question": "Compare migraine prevalence by education in NHIS 2024",
+      "ready": false
+    },
+    {
+      "id": "UNKNOWN-EN-4",
+      "question": "Compare hospitalization prevalence by education in NHIS 2024",
+      "ready": false
+    },
+    {
+      "id": "UNKNOWN-EN-5",
+      "question": "Compare kidney disease prevalence by education in NHIS 2024",
+      "ready": false
+    },
+    {
+      "id": "UNKNOWN-EN-6",
+      "question": "Compare life expectancy prevalence by education in NHIS 2024",
+      "ready": false
+    },
+    {
+      "id": "UNKNOWN-EN-7",
+      "question": "Compare neuropathy prevalence by education in NHIS 2024",
+      "ready": false
+    },
+    {
+      "id": "UNKNOWN-ZH-0",
+      "question": "按教育比较哮喘患病率",
+      "ready": false
+    },
+    {
+      "id": "UNKNOWN-ZH-1",
+      "question": "按教育比较关节炎患病率",
+      "ready": false
+    },
+    {
+      "id": "UNKNOWN-ZH-2",
+      "question": "按教育比较痴呆患病率",
+      "ready": false
+    },
+    {
+      "id": "UNKNOWN-ZH-3",
+      "question": "按教育比较偏头痛患病率",
+      "ready": false
+    },
+    {
+      "id": "UNKNOWN-ZH-4",
+      "question": "按教育比较未知病种患病率",
+      "ready": false
+    },
+    {
+      "id": "POP-0",
+      "question": "Compare fair/poor health by education among married adults",
+      "ready": false
+    },
+    {
+      "id": "POP-1",
+      "question": "Compare fair/poor health by education among unmarried adults",
+      "ready": false
+    },
+    {
+      "id": "POP-2",
+      "question": "Compare fair/poor health by education among divorced adults",
+      "ready": false
+    },
+    {
+      "id": "POP-3",
+      "question": "Compare fair/poor health by education among employed adults",
+      "ready": false
+    },
+    {
+      "id": "POP-4",
+      "question": "Compare fair/poor health by education among unemployed adults",
+      "ready": false
+    },
+    {
+      "id": "POP-5",
+      "question": "Compare fair/poor health by education among retired adults",
+      "ready": false
+    },
+    {
+      "id": "POP-6",
+      "question": "Compare fair/poor health by education among rural adults",
+      "ready": false
+    },
+    {
+      "id": "POP-7",
+      "question": "Compare fair/poor health by education among urban adults",
+      "ready": false
+    },
+    {
+      "id": "POP-8",
+      "question": "Compare fair/poor health by education among gardeners adults",
+      "ready": false
+    },
+    {
+      "id": "EXCLUDE-0",
+      "question": "Compare fair/poor health by education excluding women",
+      "ready": true,
+      "spec": {
+        "filters": {
+          "sex": "male"
+        }
+      }
+    },
+    {
+      "id": "EXCLUDE-1",
+      "question": "Compare fair/poor health by education except women",
+      "ready": true,
+      "spec": {
+        "filters": {
+          "sex": "male"
+        }
+      }
+    },
+    {
+      "id": "EXCLUDE-2",
+      "question": "Compare fair/poor health by education without women",
+      "ready": true,
+      "spec": {
+        "filters": {
+          "sex": "male"
+        }
+      }
+    },
+    {
+      "id": "EXCLUDE-3",
+      "question": "Compare fair/poor health by education not including women",
+      "ready": true,
+      "spec": {
+        "filters": {
+          "sex": "male"
+        }
+      }
+    },
+    {
+      "id": "EXCLUDE-4",
+      "question": "Compare fair/poor health by education 排除女性",
+      "ready": true,
+      "spec": {
+        "filters": {
+          "sex": "male"
+        }
+      }
+    },
+    {
+      "id": "EXCLUDE-5",
+      "question": "Compare fair/poor health by education 不包括女性",
+      "ready": true,
+      "spec": {
+        "filters": {
+          "sex": "male"
+        }
+      }
+    },
+    {
+      "id": "NEGATION-0",
+      "question": "Compare fair/poor health by education not excluding women",
+      "ready": false
+    },
+    {
+      "id": "NEGATION-1",
+      "question": "Compare fair/poor health by education do not exclude women",
+      "ready": false
+    },
+    {
+      "id": "NEGATION-2",
+      "question": "Compare fair/poor health by education 不排除女性",
+      "ready": false
+    },
+    {
+      "id": "NEGATION-3",
+      "question": "Compare fair/poor health by education women only excluding women",
+      "ready": false
+    },
+    {
+      "id": "NEGATION-4",
+      "question": "Compare fair/poor health by education excluding women and men",
+      "ready": false
+    },
+    {
+      "id": "NEGATION-5",
+      "question": "Compare fair/poor health by education excluding men and women",
+      "ready": false
+    },
+    {
+      "id": "ADJUST-0",
+      "question": "Fit a fair/poor health regression adjusted for occupation",
+      "ready": false
+    },
+    {
+      "id": "ADJUST-1",
+      "question": "Fit a fair/poor health regression adjusted for marital status",
+      "ready": false
+    },
+    {
+      "id": "ADJUST-2",
+      "question": "Fit a fair/poor health regression adjusted for employment status",
+      "ready": false
+    },
+    {
+      "id": "ADJUST-3",
+      "question": "Fit a fair/poor health regression adjusted for religion",
+      "ready": false
+    },
+    {
+      "id": "ADJUST-4",
+      "question": "Fit a fair/poor health regression adjusted for wealth",
+      "ready": false
+    },
+    {
+      "id": "YEAR",
+      "question": "Compare fair/poor health by education in 2023",
+      "ready": false
+    },
+    {
+      "id": "CONFIDENCE",
+      "question": "Compare fair/poor health by education with 99 percent confidence",
+      "ready": false
+    },
+    {
+      "id": "READY-EDUCATION",
+      "question": "Compare fair or poor self-rated health by education",
+      "ready": true,
+      "spec": {
+        "group_by": "education",
+        "filters": {}
+      }
+    },
+    {
+      "id": "READY-FEMALE",
+      "question": "Compare fair/poor health by education among women",
+      "ready": true,
+      "spec": {
+        "filters": {
+          "sex": "female"
+        }
+      }
+    },
+    {
+      "id": "READY-AGE",
+      "question": "Compare fair/poor health by education among adults aged 25-34",
+      "ready": true,
+      "spec": {
+        "filters": {
+          "age": "25_34"
+        }
+      }
+    },
+    {
+      "id": "READY-INSURED",
+      "question": "Show health insurance coverage distribution",
+      "ready": true,
+      "spec": {
+        "outcome": "insured"
+      }
+    },
+    {
+      "id": "READY-UNMET",
+      "question": "Show the proportion of unmet medical care due to cost",
+      "ready": true,
+      "spec": {
+        "outcome": "unmet_care_cost"
+      }
+    },
+    {
+      "id": "READY-INCOME",
+      "question": "Compare self-rated health by income",
+      "ready": true,
+      "spec": {
+        "group_by": "income"
+      }
+    },
+    {
+      "id": "POP-DISABILITIES",
+      "question": "Compare fair/poor health by education among adults with disabilities",
+      "ready": false
+    },
+    {
+      "id": "EXCLUDE-PLURAL",
+      "question": "Compare fair/poor health by education excluding females",
+      "ready": true,
+      "spec": {
+        "filters": {
+          "sex": "male"
+        }
+      }
+    },
+    {
+      "id": "GROUP-RELIGION",
+      "question": "Compare fair/poor health by religion",
+      "ready": false
+    },
+    {
+      "id": "GROUP-MIXED",
+      "question": "Compare fair/poor health by education and religion",
+      "ready": false
+    },
+    {
+      "id": "POP-WORKING",
+      "question": "Compare fair/poor health by education among working adults",
+      "ready": false
+    },
+    {
+      "id": "POP-LANGUAGE",
+      "question": "Compare fair/poor health by education among English-speaking adults",
+      "ready": false
+    },
+    {
+      "id": "POP-UNKNOWN-WITH",
+      "question": "Compare fair/poor health by education among adults with neuropathy",
+      "ready": false
+    },
+    {
+      "id": "EXCLUDE-HISPANIC",
+      "question": "Compare fair/poor health by education excluding Hispanic adults",
+      "ready": true,
+      "spec": {
+        "filters": {
+          "race": [
+            "nh_white",
+            "nh_black",
+            "nh_asian",
+            "nh_other"
+          ]
+        }
+      }
+    },
+    {
+      "id": "EXCLUDE-NH-WHITE",
+      "question": "Compare fair/poor health by education excluding non-Hispanic white adults",
+      "ready": true,
+      "spec": {
+        "filters": {
+          "race": [
+            "hispanic",
+            "nh_black",
+            "nh_asian",
+            "nh_other"
+          ]
+        }
+      }
+    },
+    {
+      "id": "EXCLUDE-UNKNOWN-CATEGORY",
+      "question": "Compare fair/poor health by education excluding Asian adults",
+      "ready": false
+    },
+    {
+      "id": "EXCLUDE-ALL-WOMEN",
+      "question": "Compare fair/poor health by education excluding all women",
+      "ready": true,
+      "spec": {
+        "filters": {
+          "sex": "male"
+        }
+      }
+    },
+    {
+      "id": "DOUBLE-NOT-ONLY",
+      "question": "Compare fair/poor health by education not only women",
+      "ready": false
+    }
+  ]
+}

@@ -99,11 +99,18 @@ class HostedHttpTests(unittest.TestCase):
     def test_readiness_reports_configuration_without_claiming_model_verification(self):
         status,_,body=self.request('GET','/readyz',authenticated=True)
         self.assertEqual(status,503)
-        self.assertEqual(json.loads(body),{'status':'not_configured'})
+        payload=json.loads(body)
+        self.assertEqual(payload['status'],'not_configured')
+        self.assertFalse(payload['chat']['configured'])
+        self.assertEqual(payload['chat']['last_observed_status'],'not_configured')
+        self.assertIn('observed_at',payload['statistics'])
         with patch.object(self.agent,'dialogue_status',return_value={'configured':True}):
             status,_,body=self.request('GET','/readyz',authenticated=True)
         self.assertEqual(status,200)
-        self.assertEqual(json.loads(body),{'status':'configured'})
+        payload=json.loads(body)
+        self.assertEqual(payload['status'],'configured')
+        self.assertEqual(payload['chat']['last_observed_status'],'unverified')
+        self.assertIn('sends no model request',payload['probe'])
 
 
 if __name__=='__main__':

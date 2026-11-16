@@ -16,6 +16,13 @@
   let busy = false, composing = false, currentJobId = null, generation = 0;
   let pollTimer = null, autoFollow = true, jobEvents = [], processSelection = 'live', publicRecordUrl = null;
   let historyRevision = 0, pendingDeletion = null, deleting = false;
+  let composerRevision = 0;
+  const conversationDrafts = new Map();
+  let pendingSubmission = null, currentJob = null;
+  let conversationCursor = null, runCursor = null, conversationTailLoaded = false, runTailLoaded = false;
+  let chatPageRevision = 0, runPageRevision = 0, messagePageRevision = 0;
+  let chatsPageLoading = false, runsPageLoading = false, messagesPageLoading = false;
+  const clientIdPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
   const isPublic = () => state?.access?.public === true;
   const ownerAllowed = () => state?.access?.public === false;
   const cookiesUnavailable = () => isPublic() && typeof navigator !== 'undefined' && navigator.cookieEnabled === false;
@@ -74,7 +81,9 @@
     document.documentElement.style.setProperty('--composer-height', `${Math.ceil($('composer-dock').getBoundingClientRect().height)}px`);
     $('ask-button').disabled = busy || !$('question').value.trim();
   }
-  function fillQuestion(value) { $('question').value = value; autoGrow(); $('question').focus(); }
+  function composerInput() { composerRevision++; autoGrow(); }
+  function setComposer(value) { $('question').value = value; composerRevision++; autoGrow(); }
+  function fillQuestion(value) { setComposer(value); $('question').focus(); }
   function closeSidebar() {
     document.body.classList.remove('sidebar-open'); $('sidebar-backdrop').hidden = true;
     $('app-main').inert = false;
@@ -100,6 +109,41 @@
   }
   function openView(name) { if (['methods', 'data', 'history'].includes(name)) { openDialog(`${name}-dialog`); if (name === 'history') loadHistory(); if (name === 'data') refreshStatus(); } }
   function saveActive(id) { try { if (conversationPattern.test(id || '')) sessionStorage.setItem(storageKey, id); else sessionStorage.removeItem(storageKey); } catch (_) { /* Storage is optional. */ } }
+  function newClientMessageId() {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+    if (typeof crypto === 'undefined' || typeof crypto.getRandomValues !== 'function') throw new Error('Secure browser storage and random IDs are required to send messages. Open this site over HTTPS or localhost.');
+    const bytes = crypto.getRandomValues(new Uint8Array(16)); bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128;
+    const hex = [...bytes].map((value) => value.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+  function pendingStorageKey(id) { return `${storageKey}_pending_${id}`; }
+  function validPending(value, id) {
+    return value && value.conversation_id === id && clientIdPattern.test(value.client_message_id || '') && typeof value.message === 'string' && value.message.trim() && value.message.length <= 2000 && typeof value.measure_model === 'boolean' && value.repeats === 5 && value.prompt_versions === 3;
+  }
+  function restorePendingSubmission(id) {
+    pendingSubmission = null;
+    if (!conversationPattern.test(id || '')) return null;
+    try {
+      const raw = sessionStorage.getItem(pendingStorageKey(id)); if (!raw) return null;
+      const record = JSON.parse(raw);
+      if (validPending(record, id)) pendingSubmission = record; else sessionStorage.removeItem(pendingStorageKey(id));
+    } catch (_) { /* Corrupt or unavailable storage never authorizes a resubmission. */ }
+    return pendingSubmission;
+  }
+  function rememberSubmission(record) {
+    if (!validPending(record, record.conversation_id)) throw new Error('The submission could not be prepared safely.');
+    try { sessionStorage.setItem(pendingStorageKey(record.conversation_id), JSON.stringify(record)); }
+    catch (_) { throw new Error('Your browser could not save the submission ID. Allow site storage before sending this message.'); }
+    pendingSubmission = record;
+  }
+  function acknowledgeSubmission(id, clientId) {
+    if (!clientIdPattern.test(clientId || '')) return;
+    try {
+      const raw = sessionStorage.getItem(pendingStorageKey(id));
+      if (raw && JSON.parse(raw).client_message_id === clientId) sessionStorage.removeItem(pendingStorageKey(id));
+    } catch (_) { /* In-memory state still prevents an automatic retry. */ }
+    if (pendingSubmission?.conversation_id === id && pendingSubmission.client_message_id === clientId) pendingSubmission = null;
+  }
   async function requireSession() {
     if (!state) await refreshStatus();
     if (!state) throw new Error('Unable to confirm the service status. Refresh the page and try again.');
@@ -109,7 +153,10 @@
     const scope = String(status.access?.scope || (status.access?.public === true ? 'public' : 'private'));
     const changed = accessScope !== null && accessScope !== scope;
     if (changed) {
-      ++generation; ++historyRevision; saveActive(null); conversations.clear(); runs.clear(); deletedConversationIds.clear();
+      ++generation; ++historyRevision; saveActive(null);
+      for (const id of conversations.keys()) { try { sessionStorage.removeItem(pendingStorageKey(id)); } catch (_) { /* Scoped storage may be unavailable. */ } }
+      pendingSubmission = null; conversations.clear(); runs.clear(); deletedConversationIds.clear(); conversationDrafts.clear();
+      resetPagination();
       clearConversationView(); $('history-list').replaceChildren(); $('results').hidden = true; $('process-timeline').replaceChildren();
       for (const id of ['result-context', 'result-answer', 'result-messages', 'results-body', 'ci-chart', 'derived-results', 'comparison-body', 'gradient-comparison', 'artifact-links', 'survey-note', 'measurement-note', 'run-id']) $(id).replaceChildren();
       $('conversation-search').value = ''; $('load-run-id').value = ''; $('load-run-button').disabled = false; text($('history-error'), ''); text($('delete-description'), '');
@@ -273,6 +320,7 @@
 
   function generationLabel(record) {
     if (record?.type === 'visualization') return 'Data visualization';
+    if (record?.type === 'execution') return 'Execution status';
     return record?.status === 'ok' ? 'Model response' : 'Local explanation';
   }
   function renderServiceStatus(dialogue = {}) {
@@ -480,6 +528,7 @@
     if (role === 'assistant') value = displayMessage(value);
     const article = document.createElement('article'); article.className = `message ${role}`;
     if (metadata.id) article.dataset.messageId = metadata.id;
+    if (typeof metadata.client_message_id === 'string' && clientIdPattern.test(metadata.client_message_id)) article.dataset.clientMessageId = metadata.client_message_id;
     if (role === 'assistant') { const label = document.createElement('div'); label.className = 'message-label'; text(label, 'NHIS Lab'); const source = document.createElement('span'); source.className = 'message-generation'; text(source, generationLabel(metadata.generation)); label.append(source); article.append(label); }
     const body = document.createElement('div'); body.className = 'message-body';
     if (role === 'user') text(body, value); else richText(body, value); article.append(body);
@@ -505,8 +554,28 @@
     }
     $('conversation').append(article); $('conversation-details').hidden = false; $('welcome').hidden = true; scrollBottom();
   }
-  function renderConversation(conversation, forceScroll = false) {
+  function mergeMessagePages(older, newer) {
+    const merged = [], positions = new Map();
+    for (const message of [...asArray(older), ...asArray(newer)]) {
+      const key = typeof message.id === 'string' && message.id ? `id:${message.id}` : typeof message.client_message_id === 'string' ? `client:${message.role}:${message.client_message_id}` : null;
+      if (key && positions.has(key)) { const index = positions.get(key); merged[index] = {...merged[index], ...message}; }
+      else { if (key) positions.set(key, merged.length); merged.push(message); }
+    }
+    return merged;
+  }
+  function messagePagination() {
+    const page = activeConversation?.pagination;
+    $('load-earlier-messages').hidden = page?.has_more !== true || !pageCursor(page.before);
+    $('load-earlier-messages').disabled = busy || messagesPageLoading;
+    text($('load-earlier-messages'), messagesPageLoading ? 'Loading earlier messages…' : 'Load earlier messages');
+  }
+  function renderConversation(conversation, forceScroll = false, replaceWindow = false) {
     if (deletedConversationIds.has(conversation.id)) return;
+    const cached = conversations.get(conversation.id);
+    if (!replaceWindow && conversation.pagination && cached?.pagination && asArray(cached.messages).length) {
+      conversation = {...conversation, messages: mergeMessagePages(cached.messages, conversation.messages),
+        pagination: {...conversation.pagination, has_more: cached.pagination.has_more, before: cached.pagination.before}};
+    }
     const previousTop = $('chat-scroll').scrollTop;
     activeConversation = conversation;
     if (conversationPattern.test(conversation.id || '')) { conversations.set(conversation.id, {...conversations.get(conversation.id), ...conversation}); saveActive(conversation.id); }
@@ -516,6 +585,7 @@
     text($('conversation-heading'), conversation.title || 'New chat'); document.title = `${conversation.title || 'Chat and research'} · NHIS Lab`;
     $('question').placeholder = messages.length ? 'Ask a follow-up…' : 'Message NHIS Lab';
     renderConversationHistory();
+    messagePagination();
     if (forceScroll || autoFollow) scrollBottom(forceScroll); else requestAnimationFrame(() => { $('chat-scroll').scrollTop = previousTop; });
   }
   function setBusy(value, showActivity = true) {
@@ -525,13 +595,17 @@
     document.querySelectorAll('[data-question], .chat-suggestions button, [data-delete-conversation], .sidebar-conversation').forEach((button) => { button.disabled = value; });
     $('clear-conversations').disabled = value || !conversations.size;
     $('measure-model').disabled = value || !ownerAllowed();
+    messagePagination();
+    if (!value) { $('cancel-job').hidden = true; $('cancel-job-detail').hidden = true; }
     scrollBottom();
   }
-  function clearConversationView() {
-    activeConversation = null; lastResult = null; currentJobId = null; jobEvents = []; processSelection = 'live';
+  function clearConversationView(preserveDraft = false) {
+    activeConversation = null; lastResult = null; currentJobId = null; currentJob = null; pendingSubmission = null; jobEvents = []; processSelection = 'live';
     $('conversation').replaceChildren(); $('conversation-details').hidden = true; $('welcome').hidden = false;
     text($('conversation-heading'), 'New chat'); $('last-evidence').hidden = true; $('activity-process').hidden = true;
-    $('activity').hidden = true; $('question').value = ''; $('question').placeholder = 'Message NHIS Lab'; autoFollow = true; autoGrow();
+    $('activity').hidden = true; if (!preserveDraft) setComposer(''); $('question').placeholder = 'Message NHIS Lab'; autoFollow = true; autoGrow();
+    $('cancel-job').hidden = true; $('cancel-job-detail').hidden = true;
+    ++messagePageRevision; messagesPageLoading = false; $('load-earlier-messages').hidden = true; $('message-page-error').hidden = true;
   }
   async function resetWorkspace() {
     if (busy) return;
@@ -555,25 +629,148 @@
       recordRun(response.result, question);
     }
     if (job.events) renderProcess(job.events, true);
-    currentJobId = null; void Promise.allSettled([refreshStatus(), loadHistory()]); scrollBottom();
+    currentJobId = null; currentJob = job; void Promise.allSettled([refreshStatus(), loadHistory()]); scrollBottom();
+  }
+  function executionState(job) {
+    const value = job?.execution_state || job?.status;
+    return value === 'complete' ? 'succeeded' : ['queued', 'running', 'succeeded', 'failed', 'blocked', 'cancelled', 'unknown'].includes(value) ? value : 'unknown';
+  }
+  function updateJobControls(job) {
+    currentJob = job;
+    const phase = executionState(job), active = ['queued', 'running'].includes(phase);
+    $('cancel-job').hidden = !active || !currentJobId; $('cancel-job').disabled = !!job.cancel_requested;
+    text($('cancel-job'), job.cancel_requested ? 'Cancellation requested' : 'Cancel turn');
+    $('cancel-job-detail').hidden = !job.cancel_requested;
+    text($('cancel-job-detail'), job.cancel_requested ? 'Waiting for a safe stopping point. Work already sent or completed is not undone.' : '');
+    if (phase === 'queued') { text($('activity-title'), 'Waiting in queue'); text($('activity-detail'), 'This saved turn is waiting for an available worker.'); }
+    else if (phase === 'running' && !processEvents(job.events).length) text($('activity-title'), 'Working on your message');
+    if (job.client_message_id) acknowledgeSubmission(activeConversation?.id, job.client_message_id);
+  }
+  function appendJobNotice(job, phase = executionState(job)) {
+    const id = job.id || currentJobId;
+    const marker = `job-status-${id}-${phase}`;
+    if ([...$('conversation').children].some((node) => node.dataset?.messageId === marker)) return;
+    const messages = {
+      recovery: 'This saved turn was interrupted and is waiting for explicit recovery. No unfinished step or model request was automatically restarted. Resume saved work only when the server identifies it as safe, or cancel this saved turn.',
+      unknown: 'The outcome of this saved turn is uncertain. An external request may already have been sent, so it will not be repeated automatically. Review the saved conversation and execution records before starting a new turn.',
+      cancelled: 'This turn was cancelled. Cancellation does not undo completed work or a remote request already sent, and does not guarantee a refund. No request was repeated automatically.',
+      blocked: 'This turn was blocked by a recorded check. No unreleased estimate is presented, and no request was repeated automatically.',
+      failed: 'This turn could not complete. Saved messages and available results remain in the conversation. No request was repeated automatically.',
+    };
+    appendMessage('assistant', job.unavailable ? 'This saved job is unavailable, so its execution outcome cannot be confirmed. No request was resubmitted. Review the saved messages before starting a new turn.' : messages[phase] || messages.unknown, phase,
+      {id: marker, generation: {status: 'local', type: 'execution'}, process: job.events});
+    const article = $('conversation').lastElementChild, actions = document.createElement('div'); actions.className = 'message-actions';
+    const restore = document.createElement('button'); restore.type = 'button'; text(restore, 'Check saved conversation');
+    const conversationId = activeConversation?.id;
+    restore.addEventListener('click', () => { if (!busy && activeConversation?.id === conversationId) openConversation(conversationId); }); actions.append(restore);
+    if (job.can_resume === true && phase !== 'cancelled' && conversationPattern.test(id || '')) {
+      const resume = document.createElement('button'); resume.type = 'button'; text(resume, 'Resume saved work');
+      resume.addEventListener('click', () => resumeSavedJob(id, conversationId)); actions.append(resume);
+    }
+    if (phase === 'recovery' && !job.cancel_requested && conversationPattern.test(id || '')) {
+      const cancel = document.createElement('button'); cancel.type = 'button'; text(cancel, 'Cancel saved turn');
+      cancel.addEventListener('click', () => cancelSavedJob(id, conversationId)); actions.append(cancel);
+    }
+    article.append(actions);
+  }
+  async function finishJob(job, version, conversationId) {
+    if (version !== generation || activeConversation?.id !== conversationId) return;
+    const phase = executionState(job) === 'queued' && job.recovery_required === true ? 'recovery' : executionState(job);
+    if (job.response) await acceptJob(job, version, conversationId);
+    if (phase !== 'succeeded') appendJobNotice(job, phase);
+    currentJobId = null; currentJob = job; $('cancel-job').hidden = true; $('cancel-job-detail').hidden = true;
   }
   async function pollJob(id, version, conversationId) {
     if (!conversationPattern.test(id || '')) throw new Error('The service did not return a valid job ID.');
     currentJobId = id;
     while (currentJobId === id && version === generation && activeConversation?.id === conversationId) {
-      const job = await api(`/api/jobs/${id}`, undefined, 25000);
+      let job;
+      try { job = await api(`/api/jobs/${id}`, undefined, 25000); }
+      catch (error) {
+        if (error.status !== 404 || version !== generation || activeConversation?.id !== conversationId) throw error;
+        job = {id, execution_state: 'unknown', unavailable: true};
+      }
       if (currentJobId !== id || version !== generation || activeConversation?.id !== conversationId) return;
+      job = {...job, id: job.id || id};
       if (job.events) renderProcess(job.events, true);
-      if (job.status === 'complete') { await acceptJob(job, version, conversationId); return; }
-      if (job.status === 'failed') throw new Error(typeof job.error === 'string' ? job.error : 'This turn did not finish. No automatic retry was made.');
-      if (job.status !== 'running') throw new Error('The job status is unknown. Restore the chat before deciding whether to retry.');
+      updateJobControls(job);
+      if ((executionState(job) === 'queued' && job.recovery_required === true) || !['queued', 'running'].includes(executionState(job))) { await finishJob(job, version, conversationId); return; }
       await new Promise((resolve) => setTimeout(resolve, 750));
     }
   }
+  function pendingNotice(record, message = '') {
+    const marker = `submission-${record.client_message_id}`;
+    if ([...$('conversation').children].some((node) => node.dataset?.messageId === marker)) return;
+    appendMessage('assistant', `${message ? message + '\n\n' : ''}Delivery of the previous turn has not been confirmed. Its submission ID is saved in this browser. Check the saved conversation or explicitly retry the same submission; no automatic retry has occurred. Your next draft is preserved.`, 'unknown', {id: marker, generation: {status: 'local', type: 'execution'}});
+    const actions = document.createElement('div'); actions.className = 'message-actions';
+    const retry = document.createElement('button'); retry.type = 'button'; text(retry, 'Retry same submission'); retry.addEventListener('click', () => retryPendingSubmission(record.client_message_id));
+    const restore = document.createElement('button'); restore.type = 'button'; text(restore, 'Check saved conversation'); restore.addEventListener('click', () => { if (!busy) openConversation(record.conversation_id); });
+    actions.append(retry, restore); $('conversation').lastElementChild.append(actions);
+  }
+  function submissionProblem(error, conversationId) {
+    const record = restorePendingSubmission(conversationId);
+    if (record) { pendingNotice(record, errorText(error)); return; }
+    appendMessage('assistant', `${errorText(error)}\n\nNo message or model call was automatically repeated. Restore this chat to check its saved state before starting another turn.`, 'error', {generation: {status: 'local', type: 'execution'}});
+    if (conversationPattern.test(conversationId || '')) {
+      const actions = document.createElement('div'); actions.className = 'message-actions'; const recover = document.createElement('button'); recover.type = 'button'; text(recover, 'Restore chat without resending');
+      recover.addEventListener('click', () => { if (!busy) openConversation(conversationId); }); actions.append(recover); $('conversation').lastElementChild.append(actions);
+    }
+  }
+  async function postSubmission(record, version) {
+    if (record.measure_model && !ownerAllowed()) throw new Error('Independent benchmarks are unavailable for this session. This saved submission was not sent.');
+    const response = await api(`/api/conversations/${record.conversation_id}/messages`, {message: record.message, client_message_id: record.client_message_id, measure_model: record.measure_model, repeats: record.repeats, prompt_versions: record.prompt_versions});
+    if (version !== generation || activeConversation?.id !== record.conversation_id) return;
+    if (!response.job_id && response.conversation?.id !== record.conversation_id && !response.message) throw new Error('The service did not acknowledge this turn. Its submission ID is still saved.');
+    acknowledgeSubmission(record.conversation_id, record.client_message_id);
+    if (response.job_id) await pollJob(response.job_id, version, record.conversation_id);
+    else await acceptJob({response, events: processEvents(response.message?.process)}, version, record.conversation_id);
+  }
+  async function retryPendingSubmission(clientId) {
+    if (busy || !activeConversation?.id) return;
+    const record = restorePendingSubmission(activeConversation.id);
+    if (!record || (clientId && record.client_message_id !== clientId)) { showSystemError('This saved submission has already been acknowledged or is no longer available.'); return; }
+    const version = ++generation; setBusy(true); showSystemError(''); text($('activity-title'), 'Checking the saved submission'); text($('activity-detail'), 'Reusing its original submission ID; no new turn is created.');
+    try { await requireSession(); if (version === generation) await postSubmission(record, version); }
+    catch (error) { if (version === generation) { currentJobId = null; submissionProblem(error, record.conversation_id); } }
+    finally { if (version === generation) { setBusy(false); $('question').focus(); } }
+  }
+  async function cancelCurrentJob() {
+    const id = currentJobId, conversationId = activeConversation?.id, version = generation;
+    if (!conversationPattern.test(id || '') || !currentJob || !['queued', 'running'].includes(executionState(currentJob)) || currentJob.cancel_requested) return;
+    $('cancel-job').disabled = true;
+    try {
+      const result = await api(`/api/jobs/${id}/cancel`, {}); if (version !== generation || currentJobId !== id || activeConversation?.id !== conversationId) return;
+      const job = {...(result.job || result), id}; if (job.events) renderProcess(job.events, true); updateJobControls(job);
+      if (!['queued', 'running'].includes(executionState(job))) { await finishJob(job, version, conversationId); if (version === generation) setBusy(false); }
+    } catch (error) { if (version === generation && currentJobId === id) { text($('cancel-job-detail'), errorText(error)); $('cancel-job-detail').hidden = false; $('cancel-job').disabled = false; } }
+  }
+  async function resumeSavedJob(id, conversationId) {
+    if (busy || activeConversation?.id !== conversationId || !conversationPattern.test(id || '')) return;
+    const version = ++generation; setBusy(true); showSystemError(''); text($('activity-title'), 'Requesting recovery of saved work'); text($('activity-detail'), 'The server checks whether unfinished steps can be resumed safely.');
+    try {
+      const result = await api(`/api/jobs/${id}/resume`, {}); if (version !== generation || activeConversation?.id !== conversationId) return;
+      const job = {...(result.job || result), id};
+      if (['queued', 'running'].includes(executionState(job))) await pollJob(id, version, conversationId); else await finishJob(job, version, conversationId);
+    } catch (error) { if (version === generation) showSystemError(`${errorText(error)} No new submission was created.`); }
+    finally { if (version === generation) setBusy(false); }
+  }
+  async function cancelSavedJob(id, conversationId) {
+    if (busy || activeConversation?.id !== conversationId || !conversationPattern.test(id || '')) return;
+    const version = ++generation; setBusy(true); text($('activity-title'), 'Requesting cancellation of saved work');
+    try {
+      const result = await api(`/api/jobs/${id}/cancel`, {}); if (version !== generation || activeConversation?.id !== conversationId) return;
+      const job = {...(result.job || result), id};
+      if (['queued', 'running'].includes(executionState(job))) await pollJob(id, version, conversationId); else await finishJob(job, version, conversationId);
+    } catch (error) { if (version === generation) showSystemError(errorText(error)); }
+    finally { if (version === generation) setBusy(false); }
+  }
   async function ask(event) {
     event.preventDefault(); if (busy || composing) return;
-    const question = $('question').value.trim(); if (!question) return;
-    const version = generation; setBusy(true); showSystemError(''); jobEvents = []; processSelection = 'live'; $('activity-process').hidden = true;
+    if (currentJob && executionState(currentJob) === 'queued' && currentJob.recovery_required === true) { appendJobNotice(currentJob, 'recovery'); showSystemError('Resume or cancel the interrupted saved turn before sending another message in this chat. Your draft is preserved.'); return; }
+    if (activeConversation?.id && restorePendingSubmission(activeConversation.id)) { pendingNotice(pendingSubmission); showSystemError('Check or retry the pending submission before sending a new turn. Your draft has not been changed.'); return; }
+    const submittedDraft = $('question').value, question = submittedDraft.trim(); if (!question) return;
+    setComposer(''); const clearedRevision = composerRevision;
+    const version = ++generation; setBusy(true); showSystemError(''); jobEvents = []; processSelection = 'live'; $('activity-process').hidden = true;
     text($('activity-title'), 'Sending message'); text($('activity-detail'), '');
     try {
       await requireSession(); if (version !== generation) return;
@@ -582,31 +779,42 @@
         const conversation = response.conversation || response; if (!conversationPattern.test(conversation.id || '')) throw new Error('Unable to start the chat.'); renderConversation(conversation);
       }
       const conversationId = activeConversation.id;
-      appendMessage('user', question); scrollBottom(true);
-      const response = await api(`/api/conversations/${conversationId}/messages`, {message: question, measure_model: ownerAllowed() && $('measure-model').checked, repeats: 5, prompt_versions: 3});
-      if (version !== generation || activeConversation?.id !== conversationId) return;
-      $('question').value = ''; autoGrow();
-      if (response.job_id) await pollJob(response.job_id, version, conversationId);
-      else await acceptJob({response, events: processEvents(response.message?.process)}, version, conversationId);
+      const record = {conversation_id: conversationId, client_message_id: newClientMessageId(), message: question, measure_model: ownerAllowed() && $('measure-model').checked, repeats: 5, prompt_versions: 3};
+      rememberSubmission(record); appendMessage('user', question, undefined, {client_message_id: record.client_message_id}); scrollBottom(true);
+      await postSubmission(record, version);
     } catch (error) {
       if (version !== generation) return; currentJobId = null;
-      appendMessage('assistant', `${errorText(error)}\n\nNo message or model call was automatically repeated. Restore this chat to check its state before retrying.`, 'error');
-      if (activeConversation?.id) { const actions = document.createElement('div'); actions.className = 'message-actions'; const recover = document.createElement('button'); recover.type = 'button'; text(recover, 'Restore chat without resending'); recover.addEventListener('click', () => openConversation(activeConversation.id)); actions.append(recover); $('conversation').lastElementChild.append(actions); }
-      fillQuestion(question);
+      submissionProblem(error, activeConversation?.id);
+      if (composerRevision === clearedRevision && !$('question').value) fillQuestion(submittedDraft);
     } finally { if (version === generation) { setBusy(false); $('question').focus(); } }
   }
   async function openConversation(id, restoring = false) {
     if (!conversationPattern.test(id || '') || deletedConversationIds.has(id)) return;
     if (busy) { if (!restoring) showSystemError('A reply is still being processed. You can switch chats when it finishes.'); return; }
+    const previousConversation = activeConversation?.id, draftRevision = composerRevision;
+    if (previousConversation) conversationDrafts.set(previousConversation, $('question').value);
     const version = ++generation; setBusy(true); closeSidebar(); showSystemError('');
     text($('activity-title'), 'Restoring chat'); text($('activity-detail'), 'Loading saved messages without resending them.');
     try {
       const response = await api(`/api/conversations/${id}`, undefined, 20000); if (version !== generation || deletedConversationIds.has(id)) return;
       const conversation = response.conversation || response; if (conversation.id !== id) throw new Error('The saved chat format is invalid.');
-      clearConversationView(); renderConversation(conversation, true);
+      clearConversationView(true);
+      if (id !== previousConversation && composerRevision === draftRevision) setComposer(conversationDrafts.get(id) || '');
+      renderConversation(conversation, true);
       if (conversation.latest_result?.run_id) { lastResult = conversation.latest_result; $('last-evidence').hidden = false; }
+      restorePendingSubmission(id);
+      if (pendingSubmission && asArray(conversation.messages).some((message) => message.client_message_id === pendingSubmission.client_message_id)) acknowledgeSubmission(id, pendingSubmission.client_message_id);
       const activeJob = conversation.active_job_id || conversation.active_job?.id;
       if (activeJob) { setBusy(true); text($('activity-title'), 'Restoring the current job'); await pollJob(activeJob, version, id); }
+      else {
+        const latestJob = conversation.latest_job || conversation.last_job;
+        if (latestJob?.id) {
+          if (latestJob.client_message_id) acknowledgeSubmission(id, latestJob.client_message_id);
+          if (['queued', 'running'].includes(executionState(latestJob))) await pollJob(latestJob.id, version, id);
+          else if (executionState(latestJob) !== 'succeeded') await finishJob(latestJob, version, id);
+        }
+      }
+      if (version === generation && restorePendingSubmission(id)) pendingNotice(pendingSubmission);
     } catch (error) { if (version === generation) { currentJobId = null; showSystemError(`${errorText(error)} No messages were resent.`); if (!activeConversation) saveActive(null); } }
     finally { if (version === generation) setBusy(false); }
   }
@@ -893,29 +1101,102 @@
     if (!runPattern.test(result.run_id || '')) return;
     runs.set(result.run_id, {...runs.get(result.run_id), run_id: result.run_id, question: question || runs.get(result.run_id)?.question, status: result.status, analysis: result.spec?.analysis, group_by: result.spec?.group_by, result}); renderHistory();
   }
+  function pageCursor(value) { return typeof value === 'string' && value.length > 0 && value.length <= 4096 && !/[\s\u0000-\u001f\u007f]/.test(value) ? value : null; }
+  function resetPagination() {
+    conversationCursor = null; runCursor = null; conversationTailLoaded = false; runTailLoaded = false;
+    ++chatPageRevision; ++runPageRevision; ++messagePageRevision;
+    chatsPageLoading = false; runsPageLoading = false; messagesPageLoading = false;
+    for (const id of ['load-more-conversations', 'load-more-runs', 'load-earlier-messages', 'chat-page-error', 'message-page-error']) $(id).hidden = true;
+    text($('chat-page-error'), ''); text($('message-page-error'), '');
+  }
+  function listPagination() {
+    $('load-more-conversations').hidden = !conversationCursor; $('load-more-conversations').disabled = chatsPageLoading;
+    text($('load-more-conversations'), chatsPageLoading ? 'Loading more chats…' : 'Load more chats');
+    $('load-more-runs').hidden = !runCursor; $('load-more-runs').disabled = runsPageLoading;
+    text($('load-more-runs'), runsPageLoading ? 'Loading more analyses…' : 'Load more analyses');
+  }
+  function mergeConversationSummary(item) {
+    if (!conversationPattern.test(item.id || '') || deletedConversationIds.has(item.id)) return;
+    const cached = conversations.get(item.id);
+    if (cached?.updated_at && (!item.updated_at || String(cached.updated_at).localeCompare(String(item.updated_at)) > 0)) return;
+    conversations.set(item.id, {...cached, ...item});
+  }
+  async function loadMoreConversations() {
+    if (!conversationCursor || chatsPageLoading) return;
+    const cursor = conversationCursor, revision = historyRevision, token = ++chatPageRevision, scope = accessScope;
+    chatsPageLoading = true; $('chat-page-error').hidden = true; listPagination();
+    try {
+      const response = await api(`/api/conversations?cursor=${encodeURIComponent(cursor)}`, undefined, 15000);
+      if (scope !== accessScope || revision !== historyRevision || token !== chatPageRevision) return;
+      for (const item of asArray(response.conversations)) mergeConversationSummary(item);
+      const next = pageCursor(response.next_cursor);
+      if (next === cursor) throw new Error('The chat history cursor did not advance. Refresh the history and try again.');
+      conversationCursor = next; conversationTailLoaded = true; renderConversationHistory();
+    } catch (error) { if (scope === accessScope && token === chatPageRevision) { text($('chat-page-error'), errorText(error)); $('chat-page-error').hidden = false; } }
+    finally { if (scope === accessScope && token === chatPageRevision) { chatsPageLoading = false; listPagination(); } }
+  }
+  async function loadMoreRuns() {
+    if (!runCursor || runsPageLoading) return;
+    const cursor = runCursor, revision = historyRevision, token = ++runPageRevision, scope = accessScope;
+    runsPageLoading = true; text($('history-error'), ''); listPagination();
+    try {
+      const response = await api(`/api/runs?before=${encodeURIComponent(cursor)}`, undefined, 15000);
+      if (scope !== accessScope || revision !== historyRevision || token !== runPageRevision) return;
+      for (const item of asArray(response.runs)) if (runPattern.test(item.run_id || '')) runs.set(item.run_id, {...runs.get(item.run_id), ...item});
+      const next = runPattern.test(response.next_cursor || '') ? response.next_cursor : null;
+      if (next === cursor) throw new Error('The analysis history cursor did not advance. Refresh the history and try again.');
+      runCursor = next; runTailLoaded = true; renderHistory();
+    } catch (error) { if (scope === accessScope && token === runPageRevision) text($('history-error'), errorText(error)); }
+    finally { if (scope === accessScope && token === runPageRevision) { runsPageLoading = false; listPagination(); } }
+  }
+  async function loadEarlierMessages() {
+    const conversationId = activeConversation?.id, cursor = pageCursor(activeConversation?.pagination?.before);
+    if (busy || messagesPageLoading || !conversationId || !cursor || activeConversation.pagination.has_more !== true) return;
+    const version = generation, scope = accessScope, token = ++messagePageRevision;
+    messagesPageLoading = true; $('message-page-error').hidden = true; messagePagination();
+    try {
+      const response = await api(`/api/conversations/${conversationId}?before=${encodeURIComponent(cursor)}&limit=50`, undefined, 20000);
+      if (scope !== accessScope || version !== generation || token !== messagePageRevision || activeConversation?.id !== conversationId || deletedConversationIds.has(conversationId)) return;
+      const page = response.conversation || response;
+      if (page.id !== conversationId || !Array.isArray(page.messages)) throw new Error('The earlier messages did not match this conversation.');
+      if (page.pagination?.has_more && (!pageCursor(page.pagination.before) || page.pagination.before === cursor)) throw new Error('The message history cursor did not advance. Please restore the chat and try again.');
+      const scroll = $('chat-scroll'), previousHeight = scroll.scrollHeight, previousTop = scroll.scrollTop;
+      const messages = mergeMessagePages(page.messages, activeConversation.messages);
+      const merged = {...activeConversation, messages, pagination: {...page.pagination, before: messages[0]?.id || null}};
+      autoFollow = false; renderConversation(merged, false, true);
+      const pending = restorePendingSubmission(conversationId);
+      if (pending) {
+        if (!messages.some((message) => message.client_message_id === pending.client_message_id)) appendMessage('user', pending.message, undefined, {client_message_id: pending.client_message_id});
+        pendingNotice(pending);
+      }
+      if (currentJob && executionState(currentJob) === 'queued' && currentJob.recovery_required === true) appendJobNotice(currentJob, 'recovery');
+      else if (currentJob && !['queued', 'running', 'succeeded'].includes(executionState(currentJob))) appendJobNotice(currentJob);
+      requestAnimationFrame(() => { if (scope === accessScope && version === generation && activeConversation?.id === conversationId) scroll.scrollTop = previousTop + scroll.scrollHeight - previousHeight; });
+    } catch (error) {
+      if (scope === accessScope && version === generation && token === messagePageRevision && activeConversation?.id === conversationId) { text($('message-page-error'), errorText(error)); $('message-page-error').hidden = false; }
+    } finally { if (scope === accessScope && token === messagePageRevision) { messagesPageLoading = false; messagePagination(); } }
+  }
   async function loadHistory() {
-    const revision = ++historyRevision;
+    const revision = ++historyRevision, scope = accessScope;
+    ++chatPageRevision; ++runPageRevision; chatsPageLoading = false; runsPageLoading = false; listPagination();
     const [runResponse, conversationResponse] = await Promise.allSettled([api('/api/runs', undefined, 15000), api('/api/conversations', undefined, 15000)]);
-    if (revision !== historyRevision) return;
-    if (runResponse.status === 'fulfilled') { for (const item of asArray(runResponse.value.runs)) if (runPattern.test(item.run_id || '')) runs.set(item.run_id, {...runs.get(item.run_id), ...item}); renderHistory(); }
+    if (revision !== historyRevision || scope !== accessScope) return;
+    if (runResponse.status === 'fulfilled') { for (const item of asArray(runResponse.value.runs)) if (runPattern.test(item.run_id || '')) runs.set(item.run_id, {...runs.get(item.run_id), ...item}); if (!runTailLoaded) runCursor = runPattern.test(runResponse.value.next_cursor || '') ? runResponse.value.next_cursor : null; renderHistory(); }
     if (conversationResponse.status === 'fulfilled') {
       const items = Array.isArray(conversationResponse.value) ? conversationResponse.value : asArray(conversationResponse.value.conversations);
-      for (const item of items) {
-        if (!conversationPattern.test(item.id || '') || deletedConversationIds.has(item.id)) continue;
-        const cached = conversations.get(item.id);
-        if (cached?.updated_at && (!item.updated_at || String(cached.updated_at).localeCompare(String(item.updated_at)) > 0)) continue;
-        conversations.set(item.id, {...cached, ...item});
-      }
+      for (const item of items) mergeConversationSummary(item);
+      if (!conversationTailLoaded) conversationCursor = pageCursor(conversationResponse.value.next_cursor);
       renderConversationHistory();
     } else if (!conversations.size) { text($('conversation-history'), errorText(conversationResponse.reason)); $('conversation-history').classList.add('sidebar-empty'); }
     if (runResponse.status === 'rejected' && $('history-dialog').open) text($('history-error'), errorText(runResponse.reason));
+    listPagination();
   }
   function renderConversationHistory() {
     const host = $('conversation-history'); host.replaceChildren(); host.classList.remove('sidebar-empty');
     const search = $('conversation-search').value.trim().toLocaleLowerCase();
     const items = [...conversations.values()].filter((item) => !deletedConversationIds.has(item.id) && (!search || String(item.title || 'New chat').toLocaleLowerCase().includes(search))).sort((a, b) => String(b.updated_at || b.created_at || '').localeCompare(String(a.updated_at || a.created_at || '')));
     $('clear-conversations').disabled = busy || !conversations.size;
-    if (!items.length) { const p = document.createElement('p'); p.className = 'sidebar-empty'; text(p, search ? 'No matching chats.' : isPublic() ? 'Your saved chats appear here. Cookies keep this browser’s history separate.' : 'Your saved chats appear here.'); host.append(p); return; }
+    if (!items.length) { const p = document.createElement('p'); p.className = 'sidebar-empty'; text(p, search ? conversationCursor ? 'No matching chats in the loaded history.' : 'No matching chats.' : isPublic() ? 'Your saved chats appear here. Cookies keep this browser’s history separate.' : 'Your saved chats appear here.'); host.append(p); return; }
     for (const item of items) {
       const row = document.createElement('div'); row.className = `sidebar-chat-row${item.id === activeConversation?.id ? ' active' : ''}`;
       const button = document.createElement('button'); button.type = 'button'; button.className = `sidebar-conversation${item.id === activeConversation?.id ? ' active' : ''}`;
@@ -932,7 +1213,7 @@
     if (id !== null && (!conversationPattern.test(id) || deletedConversationIds.has(id))) return;
     pendingDeletion = {id, title: id === null ? '' : conversations.get(id)?.title || 'New chat'};
     text($('delete-title'), id === null ? 'Clear all chats?' : 'Delete this chat?');
-    text($('delete-description'), id === null ? isPublic() ? 'This permanently deletes all chats for this browser’s session. This cannot be undone. Your analysis records remain available.' : 'This permanently deletes every saved chat. This cannot be undone. Analysis records remain available.' : `“${pendingDeletion.title}” will be permanently deleted. This cannot be undone. Analysis records remain available.`);
+    text($('delete-description'), id === null ? isPublic() ? 'This permanently deletes all chats for this browser’s session. This cannot be undone. Your analysis records remain available and may retain the original question text.' : 'This permanently deletes every saved chat. This cannot be undone. Analysis records remain available and may retain the original question text.' : `“${pendingDeletion.title}” will be permanently deleted. This cannot be undone. Analysis records remain available and may retain the original question text.`);
     text($('delete-confirm'), id === null ? 'Clear all chats' : 'Delete chat'); text($('delete-error'), '');
     $('delete-confirm').disabled = false; $('delete-cancel').disabled = false; openDialog('delete-dialog'); $('delete-cancel').focus();
   }
@@ -947,9 +1228,10 @@
       catch (error) { if (error.status !== 404 || target.id === null) throw error; alreadyMissing = true; response = {deleted: [target.id], deleted_count: 0}; }
       if (version !== generation) return;
       const removed = asArray(response.deleted).filter((id) => conversationPattern.test(id));
-      if (target.id === null) { for (const id of conversations.keys()) deletedConversationIds.add(id); conversations.clear(); }
-      for (const id of removed) { deletedConversationIds.add(id); conversations.delete(id); }
-      if (target.id !== null) { deletedConversationIds.add(target.id); conversations.delete(target.id); }
+      const forget = (id) => { deletedConversationIds.add(id); conversations.delete(id); conversationDrafts.delete(id); try { sessionStorage.removeItem(pendingStorageKey(id)); } catch (_) { /* Scoped storage may be unavailable. */ } };
+      if (target.id === null) { for (const id of [...conversations.keys()]) forget(id); conversationCursor = null; conversationTailLoaded = false; ++chatPageRevision; chatsPageLoading = false; listPagination(); }
+      for (const id of removed) forget(id);
+      if (target.id !== null) forget(target.id);
       const removedActive = target.id === null || target.id === activeId || removed.includes(activeId);
       if (removedActive) { saveActive(null); clearConversationView(); $('conversation-search').value = ''; document.title = 'NHIS Lab · Chat and research'; }
       renderConversationHistory(); showSystemError(''); pendingDeletion = null; deleting = false; closeDialog($('delete-dialog'));
@@ -1026,19 +1308,23 @@
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k' && !document.querySelector('dialog[open]')) { event.preventDefault(); resetWorkspace(); }
   });
   $('conversation-search').addEventListener('input', renderConversationHistory);
+  $('load-more-conversations').addEventListener('click', loadMoreConversations);
+  $('load-more-runs').addEventListener('click', loadMoreRuns);
+  $('load-earlier-messages').addEventListener('click', loadEarlierMessages);
   $('clear-conversations').addEventListener('click', () => requestDeletion());
   $('delete-confirm').addEventListener('click', confirmDeletion);
   $('delete-dialog').addEventListener('cancel', (event) => { if (deleting) event.preventDefault(); });
   $('delete-dialog').addEventListener('close', () => { if (!deleting) pendingDeletion = null; });
   $('new-analysis').addEventListener('click', resetWorkspace);
   $('ask-form').addEventListener('submit', ask);
-  $('question').addEventListener('input', autoGrow);
+  $('question').addEventListener('input', composerInput);
   $('question').addEventListener('compositionstart', () => { composing = true; }); $('question').addEventListener('compositionend', () => { composing = false; autoGrow(); });
   $('question').addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && !composing && event.keyCode !== 229) { event.preventDefault(); $('ask-form').requestSubmit(); } });
   document.querySelectorAll('[data-question]').forEach((button) => button.addEventListener('click', () => fillQuestion(button.dataset.question)));
   $('chat-scroll').addEventListener('scroll', () => { const scroll = $('chat-scroll'); autoFollow = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 120; $('jump-to-bottom').hidden = autoFollow || $('conversation-details').hidden; }, {passive: true});
   $('jump-to-bottom').addEventListener('click', () => scrollBottom(true));
   $('activity-process').addEventListener('click', () => showProcess(jobEvents, true));
+  $('cancel-job').addEventListener('click', cancelCurrentJob);
   $('last-evidence').addEventListener('click', () => { if (lastResult) { renderResults(lastResult); openDialog('evidence-dialog'); } });
   $('load-run-form').addEventListener('submit', (event) => { event.preventDefault(); openRun($('load-run-id').value.trim()); });
   $('refresh-status').addEventListener('click', refreshStatus);

@@ -4,6 +4,7 @@ import json
 import time
 from pathlib import Path
 from .outcomes import get_outcome
+from .execution_context import current as current_execution
 
 LABELS = {
     'understand': 'Understand the question', 'scope': 'Confirm the research scope', 'data': 'Verify real data',
@@ -47,13 +48,16 @@ class ProcessTrace:
         self._starts = {}
         self._path = None
 
-    def attach(self, directory):
+    def attach(self, directory, *, resume=False):
         self._path = Path(directory) / 'process.jsonl'
-        with self._path.open('w', encoding='utf-8') as stream:
+        with self._path.open('a' if resume else 'w', encoding='utf-8') as stream:
             for event in self.events:
                 stream.write(json.dumps(event, ensure_ascii=False, allow_nan=False) + '\n')
 
     def emit(self, stage, status, detail='', facts=None):
+        execution=current_execution()
+        if execution is not None:
+            execution.check_cancelled()
         if status not in ('running', 'complete', 'blocked', 'failed', 'skipped'):
             raise ValueError('Unknown execution event state')
         now = time.monotonic()
@@ -62,9 +66,19 @@ class ProcessTrace:
         event = {'stage':stage, 'label':LABELS.get(stage, stage), 'status':status,
                  'detail':detail, 'timestamp':dt.datetime.now(dt.timezone.utc).isoformat(),
                  'facts':dict(facts or {})}
+        if execution is not None:
+            event.update(execution.identifiers())
         if stage in self._starts:
             event['elapsed_ms'] = round((now - self._starts[stage]) * 1000)
         self.events.append(event)
+        if execution is not None and execution.store is not None:
+            # Operational metadata never includes the explanatory prose/facts.
+            from .telemetry import Telemetry
+            try:Telemetry(execution.state_root).emit('process.stage',{**execution.identifiers(),
+                'stage':stage,'status':status,'elapsed_ms':event.get('elapsed_ms',0),
+                'purpose':'cache' if event['facts'].get('cache_hit') else 'checkpoint' if event['facts'].get('checkpoint_restored') else 'execution',
+                'error_code':event['facts'].get('error_code')})
+            except Exception:pass
         if self._path:
             with self._path.open('a', encoding='utf-8') as stream:
                 stream.write(json.dumps(event, ensure_ascii=False, allow_nan=False) + '\n')

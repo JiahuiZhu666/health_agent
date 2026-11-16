@@ -50,7 +50,7 @@ function fixture() {
     openRun: (id) => { sources.push(id); }, fetch: () => { throw new Error('Charts must never fetch external resources.'); },
     displayMessage: String, richText: (node, value) => { node.textContent = value; }, processEvents: () => [], copyReply() {},
     scrollBottom() {}, renderConversationHistory() {}, requestAnimationFrame: (fn) => fn(),
-    conversations: new Map(), deletedConversationIds: new Set(), activeConversation: null, autoFollow: true, saveActive() {},
+    conversations: new Map(), deletedConversationIds: new Set(), activeConversation: null, autoFollow: true, busy: false, messagesPageLoading: false, saveActive() {},
   };
   vm.createContext(context);
   for (const [from, until] of [['  function generationLabel(', '  function renderServiceStatus('], ['  function releasedChart(', '  function setBusy(']]) {

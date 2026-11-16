@@ -174,8 +174,8 @@ class ConversationDeletionTests(unittest.TestCase):
             self.agent.release.set()
         self.finished(jobs,submitted['job_id'])
         self.assertEqual(jobs.delete_conversation(cid),{'deleted':[cid],'deleted_count':1})
-        self.assertEqual(jobs._jobs,{})
         with self.assertRaises(FileNotFoundError):jobs.get(submitted['job_id'])
+        with self.assertRaises(FileNotFoundError):jobs.store.get(jobs.workspace_id,submitted['job_id'])
 
     def test_clear_discards_all_completed_job_memory_and_creates_no_new_chat(self):
         jobs=ChatJobs(self.service)
@@ -186,17 +186,20 @@ class ConversationDeletionTests(unittest.TestCase):
             self.finished(jobs,submitted['job_id'])
         result=jobs.clear_conversations()
         self.assertEqual(result['deleted'],sorted(identifiers))
-        self.assertEqual(jobs._jobs,{})
         self.assertEqual(self.service.list(),[])
         for job_id in job_ids:
             with self.assertRaises(FileNotFoundError):jobs.get(job_id)
+        with jobs.store.transaction() as connection:
+            count=connection.execute('SELECT COUNT(*) FROM jobs JOIN turns USING(turn_id) WHERE jobs.workspace_id=? AND turns.deleted=0',
+                                     (jobs.workspace_id,)).fetchone()[0]
+        self.assertEqual(count,0)
 
     def test_externally_deleted_conversation_cannot_be_read_through_old_job(self):
         cid=self.create();jobs=ChatJobs(self.service)
         submitted=jobs.submit(cid,'Hello');self.finished(jobs,submitted['job_id'])
         ConversationService(self.agent).delete(cid)
         with self.assertRaises(FileNotFoundError):jobs.get(submitted['job_id'])
-        self.assertNotIn(submitted['job_id'],jobs._jobs)
+        with self.assertRaises(FileNotFoundError):jobs.store.get(jobs.workspace_id,submitted['job_id'])
 
     def test_concurrent_submission_waits_for_delete_then_fails_without_execution(self):
         cid=self.create();jobs=ChatJobs(self.service)
@@ -219,7 +222,9 @@ class ConversationDeletionTests(unittest.TestCase):
         self.assertEqual(len(errors),1)
         self.assertIsInstance(errors[0],FileNotFoundError)
         self.assertEqual(self.agent.calls,0)
-        self.assertEqual(jobs._jobs,{})
+        with jobs.store.transaction() as connection:
+            self.assertEqual(connection.execute('SELECT COUNT(*) FROM jobs WHERE workspace_id=?',
+                                               (jobs.workspace_id,)).fetchone()[0],0)
 
 
 if __name__=='__main__':

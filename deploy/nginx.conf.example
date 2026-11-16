@@ -1,0 +1,35 @@
+# Optional self-hosted HTTPS edge. Replace host/certificate paths and keep the
+# application port private. Render manages its own edge; this file is not active
+# merely because it is committed. Test with nginx -t on the target host.
+limit_conn_zone $binary_remote_addr zone=nhis_per_ip:10m;
+limit_conn_zone $server_name zone=nhis_site:1m;
+limit_req_zone $binary_remote_addr zone=nhis_requests:10m rate=10r/s;
+
+server {
+    listen 443 ssl;
+    server_name health.example;
+    ssl_certificate /etc/letsencrypt/live/health.example/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/health.example/privkey.pem;
+    client_max_body_size 16k;
+    client_header_timeout 10s;
+    client_body_timeout 10s;
+    keepalive_timeout 5s;
+    send_timeout 30s;
+    limit_conn nhis_per_ip 8;
+    limit_conn nhis_site 64;
+    limit_conn_status 503;
+    limit_req zone=nhis_requests burst=20 nodelay;
+    limit_req_status 429;
+    # Avoid recording URLs, query strings, cookies or personal research text.
+    access_log off;
+    location / {
+        proxy_pass http://127.0.0.1:10000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 3s;
+        proxy_send_timeout 15s;
+        proxy_read_timeout 35s;
+        proxy_buffering off;
+    }
+}

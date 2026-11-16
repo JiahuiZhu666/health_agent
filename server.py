@@ -5,7 +5,7 @@ import base64
 from concurrent.futures import Future
 import hmac
 import hashlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 import json
 import mimetypes
 import os
@@ -14,9 +14,16 @@ import re
 import sys
 import threading
 import time
+import signal
+import uuid
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 import webbrowser
+from nhis_agent.runtime import BoundedHTTPServer as ThreadingHTTPServer
+from nhis_agent.storage_policy import StorageLimit
+from nhis_agent.telemetry import log_error
+from nhis_agent import data as survey_data
+from nhis_agent.execution_context import ExecutionDeadline, ExecutionCancelled
 
 ROOT = Path(__file__).resolve().parent
 
@@ -42,6 +49,14 @@ def load_environment():
                'WEB_AUTH_SECRET','NHIS_STATE_DIR','NHIS_HOST','NHIS_ALLOWED_HOSTS','NHIS_ALLOWED_ORIGINS','PORT','NHIS_AUTO_DOWNLOAD_DATA',
                'NHIS_PUBLIC_ACCESS','NHIS_PUBLIC_MESSAGES_PER_HOUR','NHIS_PUBLIC_MESSAGES_PER_DAY',
                'NHIS_PUBLIC_CHATS_PER_HOUR','NHIS_PUBLIC_CHATS_PER_DAY'}
+    allowed.update({'NHIS_MODEL_KILL_SWITCH','NHIS_BUDGET_INPUT_USD_PER_MILLION','NHIS_BUDGET_OUTPUT_USD_PER_MILLION',
+        'NHIS_HTTP_MAX_THREADS','NHIS_HTTP_LISTEN_BACKLOG','NHIS_HTTP_READ_TIMEOUT','NHIS_HTTP_CONNECTION_DEADLINE','NHIS_JOB_WALL_SECONDS',
+        'NHIS_R_MAX_WORKERS','NHIS_R_CPU_SECONDS','NHIS_R_WALL_SECONDS','NHIS_R_MEMORY_MB','NHIS_R_OUTPUT_BYTES','NHIS_R_STEPS_PER_TURN',
+        'NHIS_STORAGE_CONVERSATION_BYTES','NHIS_STORAGE_WORKSPACE_BYTES','NHIS_STORAGE_RUN_BYTES','NHIS_STORAGE_INDEX_MAX_FILES'})
+    allowed.update({'NHIS_STORAGE_BACKUP_BYTES','NHIS_RETENTION_ANONYMOUS_DAYS','NHIS_RETENTION_COMPLETED_JOBS_DAYS',
+                    'NHIS_RETENTION_CACHE_DAYS','NHIS_RETENTION_AUDIT_DAYS'})
+    allowed.update('NHIS_BUDGET_'+scope+'_'+metric for scope in ('TURN','DAY')
+        for metric in ('CALLS','INPUT_TOKENS','OUTPUT_TOKENS','COST_MICROS'))
     for line in path.read_text(encoding='utf-8').splitlines():
         line = line.strip()
         if not line or line.startswith('#') or '=' not in line:
@@ -54,10 +69,12 @@ def load_environment():
 def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=None,
                 public_access=False, public_limits=None):
     from nhis_agent.conversation import ConversationService
-    from nhis_agent.jobs import ChatJobs, ConversationBusy
+    from nhis_agent.jobs import ChatJobs, ConversationBusy, SubmissionConflict
     # The factory is created once per server; jobs remain discoverable across requests.
     conversations = ConversationService(agent) if agent is not None else None
-    chat_jobs = ChatJobs(conversations) if conversations is not None else None
+    chat_jobs = ChatJobs(conversations, state_dir=agent.root) if conversations is not None else None
+    if chat_jobs is not None:
+        chat_jobs.store.reconcile_all()
     configured_hosts = {str(value).strip().lower() for value in (allowed_hosts or []) if str(value).strip()}
     configured_origins = {str(value).strip().rstrip('/') for value in (allowed_origins or []) if str(value).strip()}
     access = workspaces = None
@@ -103,10 +120,13 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
         server_version = 'NHISLocal/0.1'
 
         def setup(self):
+            self._trace_id = uuid.uuid4().hex
             self._visitor_id = None
             self._set_cookie = None
             self._lease = None
             super().setup()
+            if hasattr(self.connection,'settimeout'):
+                self.connection.settimeout(getattr(self.server,'read_timeout',10))
 
         def finish(self):
             try:
@@ -115,16 +135,33 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
                 if self._lease is not None:
                     workspaces.release(self._visitor_id)
 
-        def _workspace(self, *, create=False):
+        def _workspace(self, *, create=False, connection=None):
             if not public_access:
                 return SimpleNamespace(agent=agent, conversations=conversations, jobs=chat_jobs)
             if self._lease is None:
-                self._lease = workspaces.acquire(self._visitor_id, create=create)
+                self._lease = workspaces.acquire(self._visitor_id, create=create, connection=connection)
             return self._lease
 
         def log_message(self, fmt, *args):
-            # Request bodies and secret config fields never enter HTTP logs.
-            sys.stderr.write('%s %s\n' % (self.log_date_time_string(), fmt % args))
+            # BaseHTTPRequestHandler normally includes raw URLs and query
+            # strings, including on malformed requests. Never format them.
+            status = str(args[1]) if len(args)>1 and str(args[1]).isdigit() else '-'
+            method = self.command if getattr(self,'command','') in ('GET','POST','DELETE','HEAD') else 'OTHER'
+            sys.stderr.write('%s trace=%s method=%s status=%s\n' %
+                (self.log_date_time_string(),self._trace_id,method,status))
+
+        def _record_error(self,event,error):
+            try:log_error(agent.root,event,error,{'trace_id':self._trace_id})
+            except Exception:pass
+
+        def _page_parameters(self):
+            query=parse_qs(urlsplit(self.path).query,keep_blank_values=True,max_num_fields=8)
+            if any(len(values)!=1 for values in query.values()):
+                raise ValueError('Pagination parameters must occur once.')
+            raw=query.get('limit',['30'])[0]
+            if not raw.isascii() or not raw.isdigit() or not 1<=int(raw)<=100:
+                raise ValueError('The page limit must be an integer from 1 to 100.')
+            return query,int(raw)
 
         def _same_origin(self):
             port = self.server.server_port
@@ -179,6 +216,7 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('X-Frame-Options', 'DENY')
             self.send_header('Referrer-Policy', 'no-referrer')
+            self.send_header('X-Trace-ID',self._trace_id)
             self.send_header('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; img-src 'self' data: blob:; frame-ancestors 'none'")
             if self._set_cookie:
                 self.send_header('Set-Cookie', self._set_cookie)
@@ -192,13 +230,14 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
         def _json(self, value, status=200, *, headers=None):
             self._send(json.dumps(browser_payload(value), ensure_ascii=False, allow_nan=False).encode(), 'application/json; charset=utf-8', status, headers=headers)
 
-        def _admit(self, kind, action):
+        def _admit(self, kind, action, *, lookup=None):
             if not public_access:
-                return action(None)
+                return action(None,None)
             # Paid work cannot begin until the durable quota transaction commits.
             admission = Future() if kind == 'message' else None
             try:
-                reservation = access.reserve(self._visitor_id, kind=kind, accept=lambda:action(admission))
+                reservation = access.reserve(self._visitor_id, kind=kind, lookup=lookup,
+                    accept_transaction=lambda connection:action(admission,connection))
             except BaseException:
                 if admission is not None:
                     admission.set_result(False)
@@ -221,14 +260,24 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
                 return
             if path == '/readyz':
                 configured = bool(agent.dialogue_status().get('configured'))
-                self._json({'status':'configured' if configured else 'not_configured'}, 200 if configured else 503)
+                runtime=agent._statistics_health.snapshot()
+                connection=agent.dialogue_status().get('connection',{})
+                self._json({'status':'configured' if configured else 'not_configured',
+                    'chat':{'configured':configured,'last_observed_status':connection.get('status','unverified')},
+                    'statistics':{key:runtime.get(key) for key in ('ready','status','observed_at','stale','refreshing')},
+                    'research':{'ready':bool(runtime.get('ready') and survey_data.status(agent.data_root).get('ready'))},
+                    'probe':'Local dependency observations only; this endpoint sends no model request.'},200 if configured else 503)
                 return
             if path == '/api/conversations':
                 try:
-                    self._json({'conversations':self._workspace().conversations.list()})
+                    query,limit=self._page_parameters()
+                    self._json(self._workspace().conversations.page(limit,query.get('cursor',[None])[0]))
                 except FileNotFoundError:
-                    self._json({'conversations':[]})
-                except Exception:
+                    self._json({'conversations':[],'next_cursor':None})
+                except ValueError as error:
+                    self._json({'error':str(error)},400)
+                except Exception as error:
+                    self._record_error('http.conversations_failed',error)
                     self._json({'error':'Conversation records could not be loaded. Try again later.'}, 500)
                 return
             chat_match = re.fullmatch(r'/api/conversations/([a-f0-9]{32})', path)
@@ -237,16 +286,28 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
                 try:
                     if chat_match:
                         workspace = self._workspace()
-                        conversation = workspace.conversations.get(chat_match[1])
+                        query,limit=self._page_parameters()
+                        if 'limit' not in query:limit=50
+                        conversation = workspace.conversations.get(chat_match[1],limit=limit,before=query.get('before',[None])[0])
                         conversation['active_job_id'] = workspace.jobs.active_job(chat_match[1])
+                        latest = workspace.jobs.latest_job(chat_match[1])
+                        if latest:
+                            conversation['latest_job']={key:value for key,value in latest.items()
+                                if key not in ('response','events','external_attempts')}
                         self._json(conversation)
                     else:
-                        self._json(self._workspace().jobs.get(job_match[1]))
+                        query,_=self._page_parameters()
+                        event_limit=query.get('event_limit',['200'])[0]
+                        before=query.get('before_event',[None])[0]
+                        if not event_limit.isascii() or not event_limit.isdigit() or (before is not None and (not before.isascii() or not before.isdigit())):
+                            raise ValueError('Event page parameters must be positive integers.')
+                        self._json(self._workspace().jobs.get(job_match[1],event_limit=int(event_limit),before_event=int(before) if before is not None else None))
                 except FileNotFoundError as error:
                     self._json({'error':str(error)}, 404)
                 except ValueError as error:
                     self._json({'error':str(error)}, 400)
-                except Exception:
+                except Exception as error:
+                    self._record_error('http.record_failed',error)
                     self._json({'error':'This conversation or job could not be loaded. Try again later.'}, 500)
                 return
             if path == '/api/status':
@@ -254,15 +315,20 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
                     state = public_status() if public_access else agent.status()
                     state['access'] = {'public':public_access, 'scope':('public-' + hashlib.sha256(self._visitor_id.encode()).hexdigest()[:16]) if public_access else 'private'}
                     self._json(state)
-                except Exception:
+                except Exception as error:
+                    self._record_error('http.status_failed',error)
                     self._json({'error': 'The status check failed. See the local service log.'}, 500)
                 return
             if path == '/api/runs':
                 try:
-                    self._json({'runs': self._workspace().agent.history()})
+                    query,limit=self._page_parameters()
+                    self._json(self._workspace().agent.history_page(limit,query.get('before',[None])[0]))
                 except FileNotFoundError:
-                    self._json({'runs':[]})
-                except Exception:
+                    self._json({'runs':[],'next_cursor':None})
+                except ValueError as error:
+                    self._json({'error':str(error)},400)
+                except Exception as error:
+                    self._record_error('http.history_failed',error)
                     self._json({'error': 'History could not be loaded. Try again later.'}, 500)
                 return
             match = re.fullmatch(r'/api/runs/([0-9]{8}T[0-9]{6}Z-[a-f0-9]{10})(?:/(report|csv))?', path)
@@ -277,6 +343,19 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
                 if target.is_symlink() or target.parent.is_symlink() or not target.is_file():
                     self._json({'error': 'The record does not exist or did not pass release checks.'}, 404)
                     return
+                if target.stat().st_size>16*1024*1024:
+                    self._json({'error':'The saved artifact exceeds its release limit.'},404)
+                    return
+                if match[2] is not None:
+                    result_path=target.parent/'result.json'
+                    try:
+                        if result_path.is_symlink() or result_path.stat().st_size>16*1024*1024:
+                            raise ValueError('Unreleased result.')
+                        if json.loads(result_path.read_text(encoding='utf-8')).get('status')!='ok':
+                            raise ValueError('Unreleased result.')
+                    except (OSError,ValueError,AttributeError):
+                        self._json({'error':'The record did not pass release checks.'},404)
+                        return
                 ctype = {'report': 'text/markdown; charset=utf-8', 'csv': 'text/csv; charset=utf-8', None: 'application/json; charset=utf-8'}[match[2]]
                 body = target.read_bytes()
                 if match[2] is None:
@@ -306,18 +385,26 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
                     raise ValueError('The request must be a JSON object.')
                 path = urlsplit(self.path).path
                 message_match = re.fullmatch(r'/api/conversations/([a-f0-9]{32})/messages', path)
+                control_match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})/(cancel|resume)',path)
                 if public_access and (path in ('/api/ask', '/api/setup-data') or (message_match and value.get('measure_model', False) is not False)):
                     self._json({'error':'This operation is available only in a private workspace.'}, 403)
                     return
                 if path == '/api/conversations':
-                    result = self._admit('create', lambda admission:self._workspace(create=True).conversations.create())
+                    result = self._admit('create', lambda admission,connection:self._workspace(create=True,connection=connection).conversations.create())
                     if result is not None:
                         self._json(result, 201)
                 elif message_match:
-                    result = self._admit('message', lambda admission:self._workspace().jobs.submit(message_match[1], value.get('message', ''),
-                        value.get('measure_model', False), value.get('repeats', 5), value.get('prompt_versions', 3), admission=admission))
+                    parameters=(message_match[1],value.get('message',''),value.get('measure_model',False),value.get('repeats',5),value.get('prompt_versions',3))
+                    client_id=value.get('client_message_id')
+                    lookup=(lambda connection:self._workspace(connection=connection).jobs.lookup_submission(*parameters,
+                        client_message_id=client_id,connection=connection)) if client_id is not None else None
+                    result = self._admit('message', lambda admission,connection:self._workspace(connection=connection).jobs.submit(*parameters,
+                        admission=admission,client_message_id=client_id,connection=connection),lookup=lookup)
                     if result is not None:
                         self._json(result, 202)
+                elif control_match:
+                    coordinator=self._workspace().jobs
+                    self._json(coordinator.request_cancel(control_match[1]) if control_match[2]=='cancel' else coordinator.resume(control_match[1]),202)
                 elif path == '/api/ask':
                     self._json(agent.ask(value.get('question', ''), value.get('measure_model', False),
                                          value.get('repeats', 5), value.get('prompt_versions', 3)))
@@ -327,15 +414,20 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
                     self._json(agent.setup_data())
                 else:
                     self._json({'error': 'Not found'}, 404)
-            except ConversationBusy as error:
+            except (ConversationBusy,SubmissionConflict) as error:
                 self._json({'error':str(error)}, 409)
             except FileNotFoundError as error:
                 self._json({'error':str(error)}, 404)
+            except (ExecutionDeadline,ExecutionCancelled):
+                self._json({'error':'Execution stopped at its configured deadline or cancellation checkpoint. Saved research records are retained.','code':'execution_stopped'},408)
+            except StorageLimit as error:
+                self._json({'error':str(error),'code':error.code},507)
             except (ValueError, TypeError) as error:
                 self._json({'error': str(error)}, 400)
             except (BrokenPipeError, ConnectionResetError):
                 pass
-            except Exception:
+            except Exception as error:
+                self._record_error('http.request_failed',error)
                 self._json({'error': 'The analysis did not finish and no results were released. See the registration and statistical logs under runs.'}, 500)
 
         def do_DELETE(self):
@@ -362,8 +454,15 @@ def handler_for(agent, *, allowed_hosts=None, allowed_origins=None, auth_secret=
                 self._json({'error':str(error)},404)
             except ValueError as error:
                 self._json({'error':str(error)},400)
-            except Exception:
+            except Exception as error:
+                self._record_error('http.delete_failed',error)
                 self._json({'error':'The conversation could not be deleted. Refresh and try again.'},500)
+    def shutdown_jobs(timeout=10):
+        if chat_jobs is not None:
+            chat_jobs.shutdown(timeout=timeout)
+        if workspaces is not None:
+            workspaces.shutdown(timeout=timeout)
+    Handler.shutdown_jobs=staticmethod(shutdown_jobs)
     return Handler
 
 
@@ -387,7 +486,7 @@ def main():
         print(json.dumps(report, ensure_ascii=False, indent=2))
         raise SystemExit(0 if report['status']=='ok' else 1)
     if args.check:
-        print(json.dumps(agent.status(), ensure_ascii=False, indent=2))
+        print(json.dumps(agent.status(wait_for_statistics=True), ensure_ascii=False, indent=2))
         return
     allowed_hosts = [value.strip() for value in os.environ.get('NHIS_ALLOWED_HOSTS','').split(',') if value.strip()]
     allowed_origins = [value.strip().rstrip('/') for value in os.environ.get('NHIS_ALLOWED_ORIGINS','').split(',') if value.strip()]
@@ -416,12 +515,21 @@ def main():
     print('NHIS research and chat agent: http://127.0.0.1:{}/'.format(server.server_port), flush=True)
     if args.open:
         webbrowser.open('http://127.0.0.1:{}/'.format(server.server_port))
+    previous_signals={}
+    if threading.current_thread() is threading.main_thread():
+        def stop_service(signum,frame):
+            raise KeyboardInterrupt
+        for signum in (signal.SIGTERM,signal.SIGINT):
+            previous_signals[signum]=signal.signal(signum,stop_service)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print('\nThe service has stopped.')
     finally:
         server.server_close()
+        server.RequestHandlerClass.shutdown_jobs(timeout=10)
+        for signum,previous in previous_signals.items():
+            signal.signal(signum,previous)
 
 
 if __name__ == '__main__':

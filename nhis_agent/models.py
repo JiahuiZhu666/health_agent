@@ -1,17 +1,17 @@
 """Registered, data-blind model measurement; no retrieval, tools, or retry loops."""
 import concurrent.futures
+import contextvars
 import hashlib
 import json
 import math
-import os
 import re
 import statistics
 import time
-import urllib.error
+import uuid
 import urllib.parse
-import urllib.request
 from datetime import datetime, timezone
 from .outcomes import get_outcome, allowed_outcomes
+from . import transport
 
 PROMPT_VERSION = "nhis-aggregate-v1"
 TEMPLATES = (
@@ -45,25 +45,7 @@ def _now():
 
 
 def resolve_config(config=None):
-    config = dict(config or {})
-    provider = config.get("provider", os.environ.get("NHIS_MODEL_PROVIDER", "openai"))
-    if provider not in ("openai", "ollama"):
-        raise ValueError('The model provider must be openai or ollama.')
-    default_url = "http://127.0.0.1:11434" if provider == "ollama" else "https://api.openai.com/v1"
-    base = str(config.get("base_url") or os.environ.get("NHIS_MODEL_BASE_URL") or default_url).rstrip("/")
-    parsed = urllib.parse.urlsplit(base)
-    if parsed.scheme not in ("https", "http") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ValueError('The model endpoint must be an HTTP(S) URL without user credentials or query parameters.')
-    if parsed.scheme == "http" and parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
-        raise ValueError('Remote model endpoints must use HTTPS. HTTP is allowed only for local models.')
-    model = str(config.get("model") or os.environ.get("NHIS_MODEL_NAME") or "").strip()
-    key = str(config.get("api_key") or os.environ.get("OPENAI_API_KEY") or "") if provider == "openai" else ""
-    if len(model) > 160 or any(ord(c) < 32 for c in model):
-        raise ValueError('The model name format is invalid.')
-    timeout = max(1.0, min(float(config.get("timeout", 25)), 60.0))
-    max_seconds = max(1.0, min(float(config.get("max_seconds", 300)), 600.0))
-    return {"provider": provider, "base_url": base, "model": model, "api_key": key,
-            "timeout": timeout, "max_seconds": max_seconds}
+    return transport.resolve_config(config)
 
 
 def public_status(config=None):
@@ -72,7 +54,7 @@ def public_status(config=None):
         ready = bool(c["model"] and (c["provider"] == "ollama" or c["api_key"]))
         return {"configured": ready, "provider": c["provider"], "model": c["model"], "base_url": c["base_url"],
                 "message": 'The model endpoint is configured but has not been verified by a real request.' if ready else 'The service is not ready. Check the server configuration.'}
-    except (ValueError, TypeError) as e:
+    except (ValueError, TypeError, OverflowError) as e:
         return {"configured": False, "message": str(e)}
 
 
@@ -146,15 +128,15 @@ def build_prompt(spec, group, version):
 
 def parse_percent(content):
     """Strictly accept a numeric percentage, not a fraction or text extraction."""
-    parsed = json.loads(content)
+    parsed = transport.strict_json(content)
     if not isinstance(parsed, dict):
         raise ValueError("Response must be a JSON object")
-    if "refusal" in parsed:
+    if set(parsed) == {"refusal"} and isinstance(parsed['refusal'], str) and parsed['refusal'].strip():
         return None, str(parsed["refusal"])[:2000]
     if set(parsed) != {"percent"}:
         raise ValueError("Expected exactly the key percent")
     value = parsed["percent"]
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 100:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 100 or not math.isfinite(value):
         raise ValueError("percent must be a finite number in [0,100]")
     return float(value) / 100.0, None
 
@@ -173,66 +155,30 @@ def _measurement_reasoning(config):
     return None
 
 
-def _call(prompt, config, deadline):
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        return {"status": "not_attempted_budget", "error": 'The run reached its registered total time budget.'}
-    messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}]
-    body = {"model": config["model"], "messages": messages, "stream": False}
-    if config["provider"] == "ollama":
-        endpoint = config["base_url"] + ("" if config["base_url"].endswith("/api/chat") else "/api/chat")
-        body.update({"format": "json", "options": {"temperature": 1, "num_predict": 160}})
-    else:
-        endpoint = config["base_url"] + ("" if config["base_url"].endswith("/chat/completions") else "/chat/completions")
-        body.update({"temperature": 1, _token_limit_field(config): 160, "response_format": {"type": "json_object"}})
-        if _measurement_reasoning(config) is not None:
-            body['reasoning_effort'] = _measurement_reasoning(config)
-    headers = {"Content-Type": "application/json", "User-Agent": "NHIS-Health-Agent/1.0"}
-    if config["api_key"]:
-        headers["Authorization"] = "Bearer " + config["api_key"]
-    request = urllib.request.Request(endpoint, json.dumps(body, ensure_ascii=False).encode(), headers=headers, method="POST")
-    result = {"attempted_at": _now()}
+def _call(prompt, config, deadline, attempt_key=None):
+    observed = transport.request(config, SYSTEM, prompt, max_output_tokens=160,
+                                 purpose='blind', response_mode='json_object',
+                                 temperature=1, deadline=deadline, attempt_key=attempt_key)
+    result = {"attempted_at": _now(), "returned_model": observed.get("model"),
+              **{key: value for key, value in observed.items()
+                 if key not in ("model", "status", "message")}}
+    if observed['status'] != 'ok':
+        result.update(status=observed.get('error_code') or observed['status'],
+                      error=observed.get('message', 'The model response was not usable.'))
+        return result
     try:
-        with urllib.request.urlopen(request, timeout=min(config["timeout"], remaining)) as response:
-            raw = response.read(2_000_001)
-        if len(raw) > 2_000_000:
-            raise ValueError("Model response exceeded the registered 2 MB limit")
-        response_text = raw.decode("utf-8")
-        if config["api_key"]:
-            response_text = response_text.replace(config["api_key"], "[REDACTED]")
-        result["raw_response"] = response_text
-        parsed = json.loads(response_text)
-        result["returned_model"] = parsed.get("model", config["model"])
-        if config["provider"] == "ollama":
-            content = parsed["message"]["content"]
-        else:
-            message = parsed["choices"][0]["message"]
-            if message.get("refusal"):
-                result.update(status="refusal", refusal=message["refusal"])
-                return result
-            content = message["content"]
-        result["content"] = content
-        estimate, refusal = parse_percent(content)
-        result.update(status="refusal" if refusal is not None else "ok", estimate=estimate)
+        estimate, refusal = parse_percent(observed['content'])
+        result.update(status='refusal' if refusal is not None else 'ok', estimate=estimate)
         if refusal is not None:
-            result["refusal"] = refusal
-    except urllib.error.HTTPError as e:
-        detail = e.read(16000).decode("utf-8", "replace")
-        if config["api_key"]:
-            detail = detail.replace(config["api_key"], "[REDACTED]")
-        result.update(status="http_error", http_status=e.code, raw_response=detail, error='The model endpoint returned HTTP ' + str(e.code))
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        message = str(e)
-        if config["api_key"]:
-            message = message.replace(config["api_key"], "[REDACTED]")
-        result.update(status="network_error", error=message)
-    except (ValueError, TypeError, KeyError, IndexError) as e:
-        result.update(status="invalid_response", error=str(e))
+            result['refusal'] = refusal
+    except (ValueError, TypeError, OverflowError, RecursionError):
+        result.update(status='invalid_response', content='',
+                      error='The completed model response did not contain the registered percentage object.')
     return result
 
 
 def measure(spec, groups, config, repeats=5, prompt_versions=3):
-    """Execute each registered call once, retaining failures and raw responses."""
+    """Execute each registered call once, retaining normalized failures and metadata."""
     if isinstance(repeats, bool) or not isinstance(repeats, int) or not 1 <= repeats <= 5:
         raise ValueError('The number of repetitions must be 1–5.')
     if isinstance(prompt_versions, bool) or not isinstance(prompt_versions, int) or not 1 <= prompt_versions <= 3:
@@ -252,18 +198,28 @@ def measure(spec, groups, config, repeats=5, prompt_versions=3):
     except ValueError as e:
         return {"status": "blocked", "message": str(e), "rows": [], "calls": []}
     registered_at = _now()
+    c["_budget_turn_id"] = uuid.uuid4().hex
     deadline = time.monotonic() + c["max_seconds"]
     calls = []
     # Four workers, one attempt per planned call. No retries/fallback providers.
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        pending = [(item, executor.submit(_call, item["prompt"], c, deadline)) for item in plan]
+        pending = []
+        for item in plan:
+            key = "blind:" + hashlib.sha256(item["prompt"].encode()).hexdigest() + ":" + str(item["version"]) + ":" + str(item["repeat"])
+            pending.append((item, executor.submit(contextvars.copy_context().run,
+                                                 _call, item["prompt"], c, deadline, key)))
         for item, future in pending:
-            result = future.result()
+            try:
+                result = future.result()
+            except Exception:
+                # One malformed provider/client response cannot erase the rest
+                # of the registered plan. Never retry this planned attempt.
+                result = {"status": "invalid_response", "error": "The planned model attempt failed validation."}
             params = {"temperature": 1, "max_output_tokens": 160, "tools": "disabled", "retrieval": "disabled"}
             if _measurement_reasoning(c) is not None:
                 params['reasoning_effort'] = _measurement_reasoning(c)
-            calls.append(dict(item, **result, provider=c["provider"], model=c["model"],
-                              params=params))
+            calls.append({**item, **result, 'provider': c['provider'], 'model': c['model'],
+                          'params': params})
     rows = []
     for group in groups:
         group_calls = [x for x in calls if x["group_id"] == group["group_id"]]
@@ -317,32 +273,17 @@ def interpret_question(question, config):
     c = resolve_config(config)
     if not public_status(c)["configured"]:
         return {"status": "blocked", "message": 'The question interpretation model is not configured on the server.'}
-    messages = [{"role": "system", "content": INTERPRETER_SYSTEM}, {"role": "user", "content": question}]
-    body = {"model": c["model"], "messages": messages, "stream": False}
-    if c["provider"] == "ollama":
-        endpoint = c["base_url"] + ("" if c["base_url"].endswith("/api/chat") else "/api/chat")
-        body.update(format="json", options={"temperature": 0, "num_predict": 500})
-    else:
-        endpoint = c["base_url"] + ("" if c["base_url"].endswith("/chat/completions") else "/chat/completions")
-        body.update({"temperature": 0, _token_limit_field(c): 500, "response_format": {"type": "json_object"}})
-    headers = {"Content-Type": "application/json"}
-    if c["api_key"]:
-        headers["Authorization"] = "Bearer " + c["api_key"]
-    record = {"version": INTERPRETER_VERSION, "sha256": INTERPRETER_HASH, "prompt": INTERPRETER_SYSTEM,
-              "question": question, "provider": c["provider"], "model": c["model"], "date": _now()}
+    observed = transport.request(c, INTERPRETER_SYSTEM, question, max_output_tokens=500,
+                                 purpose='interpreter', response_mode='json_object', temperature=0,
+                                 deadline=time.monotonic() + min(c['timeout'], 25))
+    record = {"version": INTERPRETER_VERSION, "sha256": INTERPRETER_HASH,
+              "provider": c["provider"], "model": c["model"], "date": _now(),
+              **{key: value for key, value in observed.items()
+                 if key not in ('content', 'message', 'provider', 'model')}}
+    if observed['status'] != 'ok':
+        return {"status": "clarify", "message": "Question mapping did not return a complete validated response. Specify the grouping dimension and registered categories.", "record": record}
     try:
-        request = urllib.request.Request(endpoint, json.dumps(body, ensure_ascii=False).encode(), headers=headers, method="POST")
-        with urllib.request.urlopen(request, timeout=min(c["timeout"], 25)) as response:
-            raw = response.read(200001)
-        if len(raw) > 200000:
-            raise ValueError("Question-mapping response too large")
-        text = raw.decode("utf-8")
-        if c["api_key"]:
-            text = text.replace(c["api_key"], "[REDACTED]")
-        record["raw_response"] = text
-        envelope = json.loads(text)
-        content = envelope["message"]["content"] if c["provider"] == "ollama" else envelope["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
+        parsed = transport.strict_json(observed['content'])
         if not isinstance(parsed, dict):
             raise ValueError("Question-mapping output must be an object")
         if parsed.get("status") in ("clarify", "blocked") and set(parsed) == {"status", "message"} and isinstance(parsed["message"], str):
@@ -369,9 +310,6 @@ def interpret_question(question, config):
                 "group_by": parsed["group_by"], "filters": parsed["filters"], "adjustment": parsed["adjustment"],
                 "min_n": 100, "age_min": 25, "age_max": 64, "confidence": .95}
         return {"status": "ready", "spec": spec, "spec_hash": fingerprint(spec), "record": record}
-    except (OSError, ValueError, TypeError, KeyError, IndexError) as e:
-        message = str(e)
-        if c["api_key"]:
-            message = message.replace(c["api_key"], "[REDACTED]")
-        record["error"] = message
+    except (ValueError, TypeError, KeyError, IndexError, OverflowError, RecursionError):
+        record["error_code"] = 'invalid_interpretation'
         return {"status": "clarify", "message": 'Question mapping failed validation. Specify the grouping dimension and registered categories.', "record": record}

@@ -13,3 +13,16 @@ data/*
 !data/.gitkeep
 runs/*
 !runs/.gitkeep
+node_modules/
+test-results/
+playwright-report/
+artifacts/
+backups/
+upgrades/
+previews/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+.state-backup-*/
+*.state.tar.gz

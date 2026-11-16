@@ -137,6 +137,10 @@ class PublicHttpTests(unittest.TestCase):
         # presented as released real survey output.
         (root/'runs'/run_id/'report.md').write_text('OWNED_FIXTURE_REPORT')
         (root/'runs'/run_id/'estimates.csv').write_text('OWNED_FIXTURE_CSV')
+        result_path=root/'runs'/run_id/'result.json'
+        fixture=json.loads(result_path.read_text())
+        fixture['status']='ok'  # Explicitly simulate a released fixture.
+        result_path.write_text(json.dumps(fixture))
         for suffix in ('','/report','/csv'):
             self.assertEqual(self.request('GET','/api/runs/'+run_id+suffix,alice)[0], 200)
             self.assertEqual(self.request('GET','/api/runs/'+run_id+suffix,bob)[0], 404)
@@ -186,6 +190,7 @@ class PublicHttpTests(unittest.TestCase):
         alice = self.visitor()
         a = self.create(alice)
         connection = sqlite3.connect(str(self.root/'.cache'/'public-access.sqlite3'), isolation_level=None)
+        connection.row_factory=sqlite3.Row
         broken = MagicMock(wraps=connection)
         broken.commit.side_effect = sqlite3.OperationalError('Simulated quota commit failure')
         with patch.object(PublicAccess,'_connect',return_value=broken), \
