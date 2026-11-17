@@ -36,7 +36,11 @@ class HttpTests(unittest.TestCase):
         if value is not None:
             headers += ['Content-Type: application/json', 'Content-Length: ' + str(len(payload))]
         conn = Connection(('\r\n'.join(headers) + '\r\n\r\n').encode() + payload)
-        with contextlib.redirect_stderr(io.StringIO()):
+        with contextlib.ExitStack() as fixture:
+            if agent is not None:
+                fixture.enter_context(patch.object(agent._statistics_health,'snapshot',return_value={
+                    'ready':False,'status':'blocked','observed_at':None,'stale':False,'refreshing':False}))
+            fixture.enter_context(contextlib.redirect_stderr(io.StringIO()))
             handler_for(agent)(conn, ('127.0.0.1', 4567), SimpleNamespace(server_port=8765))
         raw = bytes(conn.output)
         header, body = raw.split(b'\r\n\r\n', 1)

@@ -199,7 +199,9 @@ class PersistentStateTests(unittest.TestCase):
                  patch.object(engine.data,'status',return_value={'ready':False}), \
                  patch.object(engine.stats,'readiness',return_value={'ready':False}):
                 agent=engine.Agent(root=state)
-                actual=agent.status()
+                # The captured probe is already mocked; join that observation
+                # so this unit fixture also leaves no readiness thread behind.
+                actual=agent.status(wait_for_statistics=True)
             self.assertEqual(actual['registry'],registry)
             self.assertTrue((state/'runs').is_dir())
             self.assertFalse((state/'config').exists())

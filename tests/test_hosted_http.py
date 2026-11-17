@@ -24,6 +24,13 @@ class HostedHttpTests(unittest.TestCase):
         environment.start()
         self.addCleanup(environment.stop)
         self.agent=Agent(Path(self.folder.name))
+        # /readyz observes readiness asynchronously in production. HTTP unit
+        # fixtures supply an observation and must not launch an R child that
+        # can retain the process-wide worker slot after the test returns.
+        observation=patch.object(self.agent._statistics_health,'snapshot',return_value={
+            'ready':False,'status':'blocked','observed_at':None,'stale':False,'refreshing':False})
+        self.statistics_snapshot=observation.start()
+        self.addCleanup(observation.stop)
         self.secret='UNIT_ACCESS_PASSWORD_NOT_A_REAL_SECRET_12345'
         self.handler=handler_for(self.agent, allowed_hosts=['health-agent.example'],
                                  allowed_origins=['https://health-agent.example'], auth_secret=self.secret)
@@ -59,6 +66,16 @@ class HostedHttpTests(unittest.TestCase):
         self.assertEqual(status,200)
         self.assertEqual(json.loads(body),{'status':'ok'})
         diagnostic.assert_not_called()
+
+    def test_http_fixture_diagnostics_never_start_an_async_r_probe(self):
+        with patch('nhis_agent.r_worker.run_probe') as probe:
+            for path in ('/readyz','/api/status'):
+                status,_,body=self.request('GET',path,authenticated=True)
+                self.assertIn(status,(200,503))
+                self.assertIn('statistics',json.loads(body))
+            self.assertIsNone(self.agent._statistics_health._worker)
+            probe.assert_not_called()
+        self.assertEqual(self.statistics_snapshot.call_count,2)
 
     def test_authenticated_host_and_origin_are_both_enforced(self):
         status,_,body=self.request('POST','/api/conversations',authenticated=True,

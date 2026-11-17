@@ -26,6 +26,43 @@
     "status": "passed_locally",
     "system": "Darwin"
   },
+  "container_startup_followup": {
+    "actual_docker_execution": "pending_not_available_locally",
+    "confirmed_configuration_defect": "State initialization changed directory ownership then required FOWNER and DAC_OVERRIDE absent from the three-capability smoke profile.",
+    "container_smoke_helper_tests": 11,
+    "container_state_and_sanitized_logs_on_failure": true,
+    "hosted_ci_rerun": "pending",
+    "http_unit_tests_start_no_real_r_probe": true,
+    "init_capabilities": [
+      "CHOWN",
+      "SETUID",
+      "SETGID",
+      "FOWNER",
+      "DAC_OVERRIDE"
+    ],
+    "permission_model_tests": 4,
+    "python": "3.9.6",
+    "python_passed": 578,
+    "python_skipped": 1,
+    "python_tests_run": 579,
+    "recorded_at": "2026-11-17T00:17:00.265714+00:00",
+    "reported_failure": "CI loopback health request received connection refused.",
+    "required_runtime_security": {
+      "CapAmb": 0,
+      "CapEff": 0,
+      "CapPrm": 0,
+      "NoNewPrivs": 1,
+      "all_pid1_uids": 10001
+    },
+    "source_sha256": {
+      ".github/workflows/checks.yml": "1b91418ad1bbc4e2e718a1eebdd128a00429b5b1982670ac6ac2876097486d38",
+      "scripts/smoke_container.py": "ba88545ae4f4f2bb6d7f900f74f8b1aff2ee982b9c3a877cc1ae73d35b8b7110",
+      "tests/test_container_smoke.py": "3a8fc070d66d9bbf8586b39e24fd9fd66d30327426c9eda2eff2414806df66b9",
+      "tests/test_entrypoint_capabilities.py": "8b631143bcd84437f3064aa3e86746ad387201429952bf6e6da73ccb6940e8a9"
+    },
+    "status": "configured_and_locally_tested",
+    "system": "Darwin"
+  },
   "conversation_quality_followup": {
     "actual_nhis_age_outcomes": [
       "delayed_care_cost",

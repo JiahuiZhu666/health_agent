@@ -143,46 +143,13 @@ jobs:
             --memory 1g --memory-swap 1g --cpus 2 --pids-limit 128 --read-only \
             --tmpfs /tmp:rw,nosuid,noexec,size=256m \
             --tmpfs /var/lib/nhis:rw,nosuid,noexec,size=128m,mode=0700 \
-            --security-opt no-new-privileges --cap-drop ALL --cap-add CHOWN --cap-add SETUID --cap-add SETGID \
+            --security-opt no-new-privileges --cap-drop ALL --cap-add CHOWN --cap-add SETUID --cap-add SETGID --cap-add FOWNER --cap-add DAC_OVERRIDE \
             --env WEB_AUTH_SECRET=ci-smoke-inert-local-password-0123456789 \
             --env NHIS_ALLOWED_HOSTS=127.0.0.1:10000 \
             --env NHIS_ALLOWED_ORIGINS=http://127.0.0.1:10000 \
             --env OPENAI_API_KEY= --env NHIS_MODEL_NAME= --env NHIS_AUTO_DOWNLOAD_DATA=false nhis-lab:ci
-      - name: Verify liveness, auth, real R capability and honest unavailable-data status
-        run: |
-          python - <<'PY'
-          import base64,json,time,urllib.error,urllib.request
-          base='http://127.0.0.1:10000'
-          for attempt in range(60):
-              try:
-                  with urllib.request.urlopen(base+'/healthz',timeout=1) as response:
-                      assert json.load(response)['status']=='ok'
-                  break
-              except (OSError,ValueError,AssertionError):
-                  if attempt==59: raise
-                  time.sleep(.5)
-          try:
-              urllib.request.urlopen(base+'/api/status',timeout=5)
-              raise AssertionError('Private API was accessible without authentication')
-          except urllib.error.HTTPError as error:
-              assert error.code==401
-          authorization=base64.b64encode(b'owner:ci-smoke-inert-local-password-0123456789').decode()
-          request=urllib.request.Request(base+'/api/status',headers={'Authorization':'Basic '+authorization})
-          # Statistics readiness is an asynchronous observed local probe. Poll
-          # its snapshot without sending any model request or starting R work.
-          deadline=time.monotonic()+40
-          while True:
-              remaining=deadline-time.monotonic()
-              if remaining<=0:raise AssertionError('Observed statistics readiness did not settle within 40 seconds')
-              with urllib.request.urlopen(request,timeout=min(5,remaining)) as response: state=json.load(response)
-              if state['statistics'].get('ready') is True:break
-              time.sleep(min(.5,max(0,deadline-time.monotonic())))
-          assert state['statistics']['ready'] is True, state['statistics']
-          assert state['data']['ready'] is False
-          assert state['dialogue']['configured'] is False
-          print('Liveness, authentication, R packages and unavailable-data/model status verified.')
-          PY
-          docker exec nhis-smoke python -c 'from pathlib import Path; s=Path("/proc/1/status").read_text(); u=next(x for x in s.splitlines() if x.startswith("Uid:")); assert int(u.split()[1])==10001; print("Application runs as UID 10001")'
+      - name: Verify startup, private API, R readiness and dropped privileges
+        run: python scripts/smoke_container.py --container nhis-smoke --base-url http://127.0.0.1:10000 --output artifacts/container-smoke-state.json
       - name: Verify graceful SIGTERM shutdown
         run: |
           docker stop --time 15 nhis-smoke
@@ -190,7 +157,7 @@ jobs:
       - name: Save safe smoke logs and remove the isolated container
         if: always()
         run: |
-          docker logs nhis-smoke > artifacts/container-smoke.log 2>&1 || true
+          docker logs --tail 80 --timestamps nhis-smoke > artifacts/container-smoke.log 2>&1 || true
           docker rm --force nhis-smoke >/dev/null 2>&1 || true
       - uses: actions/upload-artifact@v4
         if: always()
